@@ -101,7 +101,7 @@ class PPOPolicy(TensorDictModuleBase):
         self.clip_param = self.cfg.clip_param
         self.critic_loss_fn = nn.MSELoss(reduction="none")
         self.action_dim = action_spec.shape[-1]
-        self.gae = GAE(0.99, 0.95)
+        self.gae = GAE(0.99, 0.95).to(self.device)
         
         if cfg.value_norm:
             value_norm_cls = ValueNorm1
@@ -150,11 +150,6 @@ class PPOPolicy(TensorDictModuleBase):
         self.critic.apply(init_)
 
         if active_adaptation.is_distributed():
-            distr.init_process_group(
-                backend="nccl",
-                world_size=active_adaptation.get_world_size(),
-                rank=active_adaptation.get_local_rank()
-            )
             for param in self.actor.parameters():
                 distr.broadcast(param, src=0)
             for param in self.critic.parameters():

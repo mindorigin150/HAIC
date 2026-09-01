@@ -8,6 +8,7 @@ import torch.utils._pytree as pytree
 import einops
 import copy
 import numpy as np
+import active_adaptation as aa
 
 from torchrl.data import CompositeSpec, TensorSpec, Unbounded
 from torchrl.modules import ProbabilisticActor
@@ -39,6 +40,33 @@ OBJECT_PRED_KEY = "object_pred"
 OBJECT_GEO_KEY = "object_geo_"
 OBJECT_TRANS_KEY = "object_trans"
 OBJECT_PRED_TRANS_KEY = "object_pred_trans"
+
+
+def _global_mean_std(value, dims):
+    if not aa.is_distributed():
+        return value.mean(dim=dims), value.std(dim=dims)
+
+    value_sum = value.sum(dim=dims).float()
+    value_ssq = value.square().sum(dim=dims).float()
+    count = value_sum.new_tensor([value.numel() // value_sum.numel()])
+    packed = torch.cat([value_sum.reshape(-1), value_ssq.reshape(-1), count])
+    aa.all_reduce(packed)
+
+    feature_count = value_sum.numel()
+    value_sum = packed[:feature_count]
+    value_ssq = packed[feature_count:2 * feature_count]
+    count = packed[-1]
+    mean = value_sum / count
+    variance = (value_ssq - value_sum.square() / count) / (count - 1.)
+    return mean.to(value.dtype), variance.clamp_min(0.).sqrt().to(value.dtype)
+
+
+def _global_mean(value):
+    if aa.is_distributed():
+        value = value.detach().clone()
+        aa.all_reduce(value)
+        value.div_(aa.get_world_size())
+    return value
 
 @dataclass
 class PPOConfig:
@@ -201,7 +229,7 @@ class PPOHAIC(TensorDictModuleBase):
         self.critic_loss_fn = nn.MSELoss(reduction="none")
         self.adapt_loss_fn = nn.MSELoss(reduction="none")
         self.rec_loss = nn.MSELoss(reduction="none")
-        self.gae = GAE(gamma=self.cfg.gamma, lmbda=self.cfg.lmbda)
+        self.gae = GAE(gamma=self.cfg.gamma, lmbda=self.cfg.lmbda).to(self.device)
         self.reward_groups = list(env.cfg.reward.keys())
         num_reward_groups = len(self.reward_groups)
         self.reward_scales = torch.ones(num_reward_groups, device=self.device)
@@ -455,6 +483,7 @@ class PPOHAIC(TensorDictModuleBase):
                 lr=cfg.lr,
             )
         self.num_updates = 0
+        aa.broadcast_module(self)
     
     def make_tensordict_primer(self):
         num_envs = self.observation_spec.shape[0]
@@ -597,6 +626,7 @@ class PPOHAIC(TensorDictModuleBase):
                 total_loss.backward()
 
                 all_params = list(self.adapt_module.parameters()) + list(self.object_adapt.parameters())
+                aa.average_gradients(self.adapt_module, self.object_adapt)
                 opt_adapt_grad_norm = nn.utils.clip_grad_norm_(all_params, self.cfg.max_grad_norm)
                 self.opt_adapt.step()
 
@@ -622,6 +652,7 @@ class PPOHAIC(TensorDictModuleBase):
 
                     self.opt_adapt_actor.zero_grad()
                     adapt_loss.backward()
+                    aa.average_gradients(self.actor_adapt)
                     self.opt_adapt_actor.step()
                     info["adapt/adapt_loss"] = adapt_loss
                 
@@ -707,7 +738,8 @@ class PPOHAIC(TensorDictModuleBase):
         # Compute and normalize the advantages
         # [num_steps, num_envs, num_reward_groups]
         if self.cfg.normalize_before_sum: # normalize, scale, sum
-            adv_norm = (adv - adv.mean(dim=(0, 1))) / (adv.std(dim=(0, 1)) + 0.01)
+            adv_mean, adv_std = _global_mean_std(adv, (0, 1))
+            adv_norm = (adv - adv_mean) / (adv_std + 0.01)
             adv_norm *= self.reward_scales
             # [num_steps, num_envs, num_reward_groups]
             adv_norm_sum = adv_norm.sum(dim=2, keepdim=True)
@@ -717,12 +749,17 @@ class PPOHAIC(TensorDictModuleBase):
             adv *= self.reward_scales
             adv_sum = adv.sum(dim=2, keepdim=True)
             # [num_steps, num_envs, 1]
-            adv_sum_norm = (adv_sum - adv_sum.mean(dim=(0, 1))) / (adv_sum.std(dim=(0, 1)) + 1e-8)
+            adv_sum_mean, adv_sum_std = _global_mean_std(adv_sum, (0, 1))
+            adv_sum_norm = (adv_sum - adv_sum_mean) / (adv_sum_std + 1e-8)
             # [num_steps, num_envs, 1]
             adv_final = adv_sum_norm
 
         if update_value_norm:
             self.value_norm.update(ret)
+            if aa.is_distributed():
+                for buffer in self.value_norm.buffers():
+                    aa.all_reduce(buffer)
+                    buffer.div_(aa.get_world_size())
         ret = self.value_norm.normalize(ret)
 
         tensordict.set(adv_key, adv_final)
@@ -774,11 +811,19 @@ class PPOHAIC(TensorDictModuleBase):
         value_loss = self.critic_loss_fn(b_returns, values)
         value_loss = value_loss[valid].mean(dim=0)
 
-        loss = policy_loss + entropy_loss + value_loss.mean()
+        valid_count = valid.sum()
+        global_valid_count = valid_count.detach().clone()
+        aa.all_reduce(global_valid_count)
+        loss_weight = valid_count * aa.get_world_size() / global_valid_count
+        loss = (policy_loss + value_loss.mean()) * loss_weight + entropy_loss
 
         self.opt_policy.zero_grad()
         self.opt_critic.zero_grad()
         loss.backward()
+        if self.cfg.phase == "train":
+            aa.average_gradients(actor, self.encoder_priv, self.critic)
+        else:
+            aa.average_gradients(actor, self.critic)
         actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), self.cfg.max_grad_norm)
         critic_grad_norm = nn.utils.clip_grad_norm_(self.critic.parameters(), self.cfg.max_grad_norm)
         if self.cfg.phase == "train":
@@ -799,7 +844,7 @@ class PPOHAIC(TensorDictModuleBase):
             #     dim=-1,
             # ).mean()
             dist_old = self.dist_cls(**dist_kwargs_old)
-            kl = D.kl_divergence(dist_old, dist).mean()
+            kl = _global_mean(D.kl_divergence(dist_old, dist).mean())
 
         info = {
             "actor/policy_loss": policy_loss.detach(),

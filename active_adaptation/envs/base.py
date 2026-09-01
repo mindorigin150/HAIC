@@ -284,8 +284,9 @@ class _Env(EnvBase):
                 self._pre_step_callbacks.append(reward.step)
                 self._post_step_callbacks.append(reward.post_step)
                 print(f"\t{rew_name}: \t{reward.weight:.2f}, \t{reward.enabled}")
-                self._stats_ema[group_name][rew_name] = (torch.tensor(0., device=self.device), torch.tensor(0., device=self.device))
-                self._perf_ema_reward[group_name][rew_name] = (torch.tensor(0., device=self.device), torch.tensor(0., device=self.device))
+                if reward.enabled:
+                    self._stats_ema[group_name][rew_name] = (torch.tensor(0., device=self.device), torch.tensor(0., device=self.device))
+                    self._perf_ema_reward[group_name][rew_name] = (torch.tensor(0., device=self.device), torch.tensor(0., device=self.device))
             
             self.reward_groups[group_name] = RewardGroup(self, group_name, funcs, multiplicative=multiplicative)
             reward_spec["stats", group_name, "return"] = UnboundedContinuous(1, device=self.device)
@@ -348,18 +349,31 @@ class _Env(EnvBase):
     @property
     def stats_ema(self):
         result = {}
+        device_values = []
+        device_keys = []
+
         for group_key, group in self._stats_ema.items():
             for rew_key, (sum, cnt) in group.items():
-                result[f"reward.{group_key}/{rew_key}"] = (sum / cnt).item()
+                device_keys.append(f"reward.{group_key}/{rew_key}")
+                device_values.append(sum / cnt)
         for group_key, group in self._perf_ema_reward.items():
-            group_time = 0.
+            group_values = []
             for rew_key, (sum, cnt) in group.items():
-                group_time += (sum / cnt).item()
-                result[f"performance_reward/{group_key}.{rew_key}"] = (sum / cnt).item()
-            result[f"performance_reward/{group_key}/total"] = group_time
+                value = sum / cnt
+                group_values.append(value)
+                device_keys.append(f"performance_reward/{group_key}.{rew_key}")
+                device_values.append(value)
+            if group_values:
+                device_keys.append(f"performance_reward/{group_key}/total")
+                device_values.append(torch.stack(group_values).sum())
         
         for key, (sum, cnt) in self._perf_ema_update.items():
-            result[f"performance_update/{key}"] = (sum / cnt).item()
+            device_keys.append(f"performance_update/{key}")
+            device_values.append(sum / cnt)
+
+        if device_values:
+            result.update(zip(device_keys, torch.stack(device_values).cpu().tolist()))
+
         result["performance/reset_time"] = self.reset_time / self.ema_cnt
         result["performance/observation_time"] = self.observation_time / self.ema_cnt
         result["performance/reward_time"] = self.reward_time / self.ema_cnt
@@ -619,6 +633,8 @@ class RewardGroup:
         rewards = []
         # try:
         for key, func in self.funcs.items():
+            if not func.enabled:
+                continue
             time_start = time.perf_counter()
             reward, count = func()
             time_end = time.perf_counter()

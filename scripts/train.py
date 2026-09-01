@@ -8,6 +8,8 @@ import logging
 import os
 import time
 import datetime
+import inspect
+import shutil
 
 from omegaconf import OmegaConf, DictConfig
 from collections import OrderedDict
@@ -44,39 +46,41 @@ def main(cfg: DictConfig):
         device=f"cuda:{aa.get_local_rank()}"
     )
     simulation_app = app_launcher.app
+    aa.init_distributed()
 
-    run = wandb.init(
-        job_type=cfg.wandb.job_type,
-        project=cfg.wandb.project,
-        mode=cfg.wandb.mode,
-        tags=cfg.wandb.tags,
-    )
-    run.config.update(OmegaConf.to_container(cfg))
-    
-    default_run_name = f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
-    run_idx = run.name.split("-")[-1]
-    run.name = f"{run_idx}-{default_run_name}"
-    setproctitle(run.name)
+    run = None
+    if aa.is_main_process():
+        run = wandb.init(
+            job_type=cfg.wandb.job_type,
+            project=cfg.wandb.project,
+            mode=cfg.wandb.mode,
+            tags=cfg.wandb.tags,
+        )
+        run.config.update(OmegaConf.to_container(cfg))
 
-    cfg_save_path = os.path.join(run.dir, "cfg.yaml")
-    OmegaConf.save(cfg, cfg_save_path)
-    run.save(cfg_save_path, policy="now")
-    run.save(os.path.join(run.dir, "config.yaml"), policy="now")
+        default_run_name = f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
+        run_idx = run.name.split("-")[-1]
+        run.name = f"{run_idx}-{default_run_name}"
+        setproctitle(run.name)
+
+        cfg_save_path = os.path.join(run.dir, "cfg.yaml")
+        OmegaConf.save(cfg, cfg_save_path)
+        run.save(cfg_save_path, policy="now")
+        run.save(os.path.join(run.dir, "config.yaml"), policy="now")
 
     env, policy, vecnorm = make_env_policy(cfg)
 
-    import inspect
-    import shutil
-    source_path = inspect.getfile(policy.__class__)
-    target_path = os.path.join(run.dir, source_path.split("/")[-1])
-    shutil.copy(source_path, target_path)
-    wandb.save(target_path, policy="now")
+    if aa.is_main_process():
+        source_path = inspect.getfile(policy.__class__)
+        target_path = os.path.join(run.dir, source_path.split("/")[-1])
+        shutil.copy(source_path, target_path)
+        wandb.save(target_path, policy="now")
 
     frames_per_batch = env.num_envs * cfg.algo.train_every
-    total_frames = cfg.get("total_frames", -1) // aa.get_world_size()
+    total_frames = cfg.total_frames // aa.get_world_size()
     total_frames = total_frames // frames_per_batch * frames_per_batch
     total_iters = total_frames // frames_per_batch
-    save_interval = cfg.get("save_interval", -1)
+    save_interval = cfg.save_interval
 
     log_interval = (env.max_episode_length // cfg.algo.train_every) + 1
     logging.info(f"Log interval: {log_interval} steps")
@@ -158,6 +162,8 @@ def main(cfg: DictConfig):
                 torch.cat([values[:, 1:], policy.critic(carry.copy())["state_value"].unsqueeze(1)], dim=1)
             )
         rollout_time = time.perf_counter() - rollout_start
+        rollout_time = torch.tensor(rollout_time, device=device)
+        aa.all_reduce(rollout_time, op=torch.distributed.ReduceOp.MAX)
 
         episode_stats.add(data_buf)
         env_frames += data_buf.numel()
@@ -170,18 +176,22 @@ def main(cfg: DictConfig):
         training_start = time.perf_counter()
         info.update(policy.train_op(data_buf))
         training_time = time.perf_counter() - training_start
+        training_time = torch.tensor(training_time, device=device)
+        aa.all_reduce(training_time, op=torch.distributed.ReduceOp.MAX)
         info.update(env.extra)
         info.update(env.stats_ema)
 
         if hasattr(policy, "step_schedule"):
             policy.step_schedule(i / total_iters)
 
-        info["env_frames"] = env_frames
-        info["rollout_fps"] = data_buf.numel() / rollout_time
-        info["training_time"] = training_time
+        info["env_frames"] = env_frames * aa.get_world_size()
+        info["rollout_fps"] = data_buf.numel() * aa.get_world_size() / rollout_time.item()
+        info["training_time"] = training_time.item()
 
         if should_save(i):
             save(policy, f"checkpoint_{i}")
+        if save_interval > 0 and i > 0 and i % save_interval == 0:
+            aa.broadcast_module(policy)
 
         if aa.is_main_process():
             # print(OmegaConf.to_yaml({k: v for k, v in info.items() if (isinstance(v, (float, int)) and not k.startswith("performance_reward"))}))
@@ -190,12 +200,14 @@ def main(cfg: DictConfig):
     # 5. --- Finalization and Cleanup ---
     if aa.is_main_process():
         save(policy, "checkpoint_final", artifact=True)
+    aa.broadcast_module(policy)
 
     policy_eval = policy.get_rollout_policy("eval")
     info, trajs, stats, policy_trajs = evaluate(env, policy_eval, render=cfg.eval_render, seed=cfg.seed)
-    run.log(info)
+    if aa.is_main_process():
+        run.log(info)
 
-    wandb.finish()
+        wandb.finish()
     os._exit(0)
     env.close()
     simulation_app.close()
@@ -211,4 +223,3 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
-

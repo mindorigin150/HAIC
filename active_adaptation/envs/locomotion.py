@@ -281,6 +281,8 @@ class SimpleEnv(_Env):
             sim_cfg.physx.gpu_found_lost_pairs_capacity = 2538320*5 # 2**20
             sim_cfg.physx.gpu_found_lost_aggregate_pairs_capacity = 61999079*4 + 2**24 # 2**26
             sim_cfg.physx.gpu_total_aggregate_pairs_capacity = 2**23*5
+            # Four partitions reduce scheduling overhead for the 4096-env PullCart workload.
+            sim_cfg.physx.gpu_max_num_partitions = 4
             sim_cfg.physx.enable_stabilization = False
             # sim_cfg.physx.gpu_collision_stack_size = 2**25
             # sim_cfg.physx.gpu_heap_capacity = 2**24
@@ -397,5 +399,3 @@ class SimpleEnv(_Env):
                     size=1.0,
                     color=(1.0, 0.0, 0.0, 0.5)  # red with transparency
                 )
-
-

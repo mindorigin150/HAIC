@@ -12,6 +12,7 @@ from typing import Sequence, List, Tuple, TYPE_CHECKING
 from tensordict import TensorDictBase, TensorDict
 from tensordict.nn import TensorDictModuleBase as ModBase
 from torchrl.envs.transforms import VecNorm
+from torchrl.envs.transforms.transforms import _append_last, _sum_left
 
 from termcolor import colored
 from collections import OrderedDict
@@ -68,6 +69,99 @@ class ObsNorm(ModBase):
             locs=vecnorm.loc,
             scales=vecnorm.scale
         )
+
+
+class DistributedVecNorm(VecNorm):
+    """Merge observation statistics across synchronized training ranks."""
+
+    def _reset(
+        self,
+        tensordict: TensorDictBase,
+        tensordict_reset: TensorDictBase,
+    ) -> TensorDictBase:
+        # Partial resets occur at different times on each rank, so only synchronized steps update global stats.
+        if self.lock is not None:
+            self.lock.acquire()
+
+        for key, key_out in zip(self.in_keys, self.out_keys):
+            if key not in tensordict_reset.keys(include_nested=True):
+                continue
+            self._init(tensordict_reset, key)
+            sum_key = _append_last(key, "_sum")
+            ssq_key = _append_last(key, "_ssq")
+            count_key = _append_last(key, "_count")
+            running_sum = self._td.get(sum_key)
+            running_ssq = self._td.get(ssq_key)
+            running_count = self._td.get(count_key)
+            mean = running_sum / running_count
+            std = (running_ssq / running_count - mean.pow(2)).clamp_min(self.eps).sqrt()
+            value = tensordict_reset.get(key)
+            tensordict_reset.set(key_out, (value - mean) / std.clamp_min(self.eps))
+
+        if self.lock is not None:
+            self.lock.release()
+        return tensordict_reset
+
+    def _call(self, tensordict: TensorDictBase) -> TensorDictBase:
+        if self.lock is not None:
+            self.lock.acquire()
+
+        entries = []
+        for key, key_out in zip(self.in_keys, self.out_keys):
+            if key not in tensordict.keys(include_nested=True):
+                continue
+            self._init(tensordict, key)
+            value = tensordict.get(key)
+            sum_key = _append_last(key, "_sum")
+            ssq_key = _append_last(key, "_ssq")
+            running_sum = self._td.get(sum_key)
+            running_ssq = self._td.get(ssq_key)
+            local_sum = _sum_left(value, running_sum).float()
+            local_ssq = _sum_left(value.pow(2), running_ssq).float()
+            local_count = local_sum.new_tensor([tensordict.numel()])
+            entries.append((key, key_out, value, local_sum, local_ssq, local_count))
+
+        if entries:
+            packed = torch.cat([
+                component.reshape(-1)
+                for _, _, _, local_sum, local_ssq, local_count in entries
+                for component in (local_sum, local_ssq, local_count)
+            ])
+            active_adaptation.all_reduce(packed)
+
+            offset = 0
+            for key, key_out, value, local_sum, local_ssq, local_count in entries:
+                feature_count = local_sum.numel()
+                global_sum = packed[offset:offset + feature_count].view_as(local_sum)
+                offset += feature_count
+                global_ssq = packed[offset:offset + feature_count].view_as(local_ssq)
+                offset += feature_count
+                global_count = packed[offset]
+                offset += 1
+
+                sum_key = _append_last(key, "_sum")
+                ssq_key = _append_last(key, "_ssq")
+                count_key = _append_last(key, "_count")
+                running_sum = self._td.get(sum_key)
+                running_ssq = self._td.get(ssq_key)
+                running_count = self._td.get(count_key)
+                if not self.frozen:
+                    running_sum.mul_(self.decay).add_(global_sum.to(running_sum.dtype))
+                    self._td.set_(sum_key, running_sum)
+                    running_ssq.mul_(self.decay).add_(global_ssq.to(running_ssq.dtype))
+                    self._td.set_(ssq_key, running_ssq)
+                    running_count.mul_(self.decay).add_(global_count.to(running_count.dtype))
+                    self._td.set_(count_key, running_count)
+
+                mean = running_sum / running_count
+                std = (running_ssq / running_count - mean.pow(2)).clamp_min(self.eps).sqrt()
+                tensordict.set(key_out, (value - mean) / std.clamp_min(self.eps))
+
+        if self.lock is not None:
+            self.lock.release()
+        return tensordict
+
+    forward = _call
 
 class ObsOODDetector(ModBase):
     def __init__(self, in_keys, sigma=5.0, ref_tensordict=None):
@@ -131,7 +225,8 @@ def make_env_policy(cfg: DictConfig):
 
     base_env = SimpleEnv(cfg.task)
 
-    checkpoint_path = parse_checkpoint_path(cfg.checkpoint_path)
+    checkpoint_path = parse_checkpoint_path(cfg.checkpoint_path) if active_adaptation.is_main_process() else None
+    checkpoint_path = active_adaptation.broadcast_object(checkpoint_path)
     if checkpoint_path is not None:
         state_dict = torch.load(checkpoint_path, weights_only=False)
     else:
@@ -145,7 +240,8 @@ def make_env_policy(cfg: DictConfig):
 
     assert cfg.vecnorm in ("train", "eval", None)
     print(colored(f"[Info]: create VecNorm for keys: {obs_keys}", "green"))
-    vecnorm = VecNorm(obs_keys, decay=0.9999)
+    vecnorm_cls = DistributedVecNorm if cfg.vecnorm == "train" and active_adaptation.is_distributed() else VecNorm
+    vecnorm = vecnorm_cls(obs_keys, decay=0.9999)
     vecnorm(base_env.fake_tensordict())
 
     if "vecnorm" in state_dict.keys():
@@ -161,7 +257,7 @@ def make_env_policy(cfg: DictConfig):
         raise ValueError
 
     env = TransformedEnv(base_env, transform)
-    env.set_seed(cfg.seed)
+    env.set_seed(cfg.seed + active_adaptation.get_rank())
     
     # setup policy
     policy_cls = hydra.utils.get_class(cfg.algo._target_)
@@ -376,4 +472,3 @@ def plot_obs_histogram(
     plt.tight_layout()
     plt.savefig(os.path.join(os.path.dirname(__file__), "trajs_obs_hist.png"))
     plt.close()
-    
