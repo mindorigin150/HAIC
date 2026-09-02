@@ -201,7 +201,11 @@ class _Env(EnvBase):
         self._debug_draw_callbacks.append(self.action_manager.debug_draw)
 
         # Register camera ray visualization if cameras are enabled
-        if self.cfg.get("enable_cameras", False) and hasattr(self, '_visualize_camera_rays'):
+        if (
+            self.cfg.get("enable_cameras", False)
+            and not self.cfg.enable_vla_camera
+            and hasattr(self, '_visualize_camera_rays')
+        ):
             self._debug_draw_callbacks.append(self._visualize_camera_rays)
         
         self.action_spec = Composite(
@@ -478,7 +482,7 @@ class _Env(EnvBase):
             # sum_, cnt = self._perf_ema_update[key]
             # sum_.add_(time_end - time_start)
             # cnt.add_(1.)
-        if self.sim.has_gui():
+        if self.sim.has_gui() and not self.cfg.enable_vla_camera:
             self.sim.render()
         self.episode_length_buf.add_(1)
         self.timestamp += 1

@@ -18,7 +18,9 @@ from termcolor import colored
 from collections import OrderedDict
 import imageio
 from omegaconf import OmegaConf, DictConfig
-import active_adaptation.learning
+import active_adaptation.learning.ppo.ppo
+import active_adaptation.learning.ppo.ppo_haic
+import active_adaptation.learning.ppo.critics
 from active_adaptation.utils.wandb import parse_checkpoint_path
 import active_adaptation
 if TYPE_CHECKING:

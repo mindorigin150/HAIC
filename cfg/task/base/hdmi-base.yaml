@@ -113,6 +113,7 @@ command:
 
 
 enable_cameras: false
+enable_vla_camera: false
 camera_width: 48    # InstinctLab: int(480/10) = 48
 camera_height: 27   # InstinctLab: int(270/10) = 27
 

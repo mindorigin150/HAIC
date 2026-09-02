@@ -12,7 +12,11 @@ class SimpleEnv(_Env):
         self.robot = self.scene.articulations["robot"]
 
         # Register camera ray visualization callback after parent init
-        if self.backend == "isaac" and self.cfg.get("enable_cameras", False):
+        if (
+            self.backend == "isaac"
+            and self.cfg.get("enable_cameras", False)
+            and not self.cfg.enable_vla_camera
+        ):
             self._debug_draw_callbacks.append(self._visualize_camera_rays)
             print("[INFO] Camera ray visualization callback registered.")
         
@@ -179,7 +183,7 @@ class SimpleEnv(_Env):
                 track_air_time=True
             )
 
-            if self.cfg.get("enable_cameras", False):
+            if self.cfg.get("enable_cameras", False) and not self.cfg.enable_vla_camera:
                 import math
                 from active_adaptation.sensors import NoisyGroupedRayCasterCameraCfg
                 from isaaclab.sensors.ray_caster import patterns, MultiMeshRayCasterCfg
@@ -263,11 +267,17 @@ class SimpleEnv(_Env):
                     intrinsics_aperture_noise_std=camera_dr.get("intrinsics_aperture_noise_std", 0.0),
                 )
                 scene_cfg.tiled_camera = ray_camera
+            elif self.cfg.enable_vla_camera:
+                from active_adaptation.vla.camera import haic_vla_camera_cfg
+
+                scene_cfg.vla_camera = haic_vla_camera_cfg()
             
             sim_cfg = sim_utils.SimulationCfg(
                 dt=self.cfg.sim.isaac_physics_dt,
                 render=sim_utils.RenderCfg(
-                    rendering_mode="quality",
+                    rendering_mode=(
+                        "performance" if self.cfg.enable_vla_camera else "quality"
+                    ),
                     # antialiasing_mode="FXAA",
                     # enable_global_illumination=True,
                     # enable_reflections=True,

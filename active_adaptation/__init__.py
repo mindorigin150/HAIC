@@ -1,5 +1,4 @@
 import os
-import active_adaptation.learning
 import torch
 import torch.distributed as distr
 

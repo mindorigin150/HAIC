@@ -29,6 +29,8 @@ from tensordict.nn import TensorDictModuleBase as ModBase
 from torchrl.modules import ProbabilisticActor
 from torchrl.data import CompositeSpec
 
+from .haic_actor import Actor, make_mlp
+
 
 OBS_KEY = "policy" # ("agents", "observation")
 OBS_PRIV_KEY = "priv"
@@ -51,24 +53,6 @@ class ResFCLayer(nn.Module):
     def forward(self, x):
         x, skip = self.linear(x).chunk(2, dim=-1)
         return self.ln(self.mish(x) + skip)
-
-
-def make_mlp(num_units, activation=nn.Mish, norm="before", dropout=0.):
-    assert norm in ("before", "after", None)
-    layers = []
-    for n in num_units:
-        layers.append(nn.LazyLinear(n))
-        if norm == "before":
-            layers.append(nn.LayerNorm(n))
-            layers.append(activation())
-        elif norm == "after":
-            layers.append(activation())
-            layers.append(nn.LayerNorm(n))
-        else:
-            layers.append(activation())
-        if dropout > 0. :
-            layers.append(nn.Dropout(dropout))
-    return nn.Sequential(*layers)
 
 
 def make_conv(num_channels, activation=nn.LeakyReLU, kernel_sizes=3, flatten: bool=True):
@@ -140,35 +124,6 @@ class Split(nn.Module):
     
     def forward(self, x: torch.Tensor):
         return x.split(self.split_size, dim=-1)
-
-
-class Actor(nn.Module):
-    def __init__(self, action_dim: int, init_noise_scale: float=1.0, predict_std: bool=False, load_noise_scale: float | None=None) -> None:
-        super().__init__()
-        self.predict_std = predict_std
-        if predict_std:
-            self.actor_mean = nn.LazyLinear(action_dim * 2)
-        else:
-            self.actor_mean = nn.LazyLinear(action_dim)
-            self.actor_std = nn.Parameter(torch.ones(action_dim) * init_noise_scale)
-        self.scale_mapping = nn.Identity()
-        self.load_noise_scale = load_noise_scale
-    
-    def forward(self, features: torch.Tensor):
-        if self.predict_std:
-            loc, scale = self.actor_mean(features).chunk(2, dim=-1)
-        else:
-            loc = self.actor_mean(features)
-            scale = torch.ones_like(loc) * self.actor_std
-        scale = self.scale_mapping(scale)
-        return loc, scale
-    
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
-                              missing_keys, unexpected_keys, error_msgs):
-        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
-                                      missing_keys, unexpected_keys, error_msgs)
-        if self.load_noise_scale is not None:
-            self.actor_std.data.fill_(self.load_noise_scale)
 
 
 class ActorCov(nn.Module):
