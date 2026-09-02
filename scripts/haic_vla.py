@@ -27,7 +27,6 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--task", default=HAIC_TASK)
     parser.add_argument("--teacher-checkpoint", required=True)
-    parser.add_argument("--student-actor-checkpoint", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--max-steps", type=int, default=1000)
@@ -36,11 +35,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-budget", type=int, default=250)
     parser.add_argument("--policy-config", type=Path)
     parser.add_argument("--inference-device", default="cuda:0")
-    parser.add_argument("--inference-batch-size", type=int, default=8)
+    parser.add_argument("--inference-batch-size", type=int, default=32)
     parser.add_argument("--dagger-round", type=int, default=0)
     parser.add_argument("--vla-cadence", type=int, default=5)
-    parser.add_argument("--row-budget", type=int, default=2_304_000)
-    parser.add_argument("--dagger-shard-rows", type=int, default=256)
+    parser.add_argument("--row-budget", type=int, default=32_000)
+    parser.add_argument("--dagger-shard-rows", type=int, default=1_000)
     parser.add_argument("--config-dir", type=Path)
     AppLauncher.add_app_launcher_args(parser)
     return parser.parse_args()
@@ -48,7 +47,7 @@ def _parse_args() -> argparse.Namespace:
 
 def _compose_cfg(args: argparse.Namespace):
     import hydra
-    import active_adaptation.learning.ppo.ppo_haic  # register Hydra configs
+    import active_adaptation.learning.ppo.ppo_haic  # noqa: F401 - registers Hydra configs
     from omegaconf import OmegaConf
 
     config_dir = args.config_dir or Path(__file__).resolve().parents[1] / "cfg"
@@ -58,6 +57,9 @@ def _compose_cfg(args: argparse.Namespace):
         f"task.num_envs={args.num_envs}",
         "task.enable_cameras=false",
         "task.enable_vla_camera=true",
+        "task.action.min_delay=0",
+        "task.action.max_delay=0",
+        "task.action.alpha=1.0",
         "app.enable_cameras=true",
         f"seed={args.seed}",
         f"checkpoint_path={args.teacher_checkpoint}",
@@ -127,23 +129,11 @@ def _new_pool(args: argparse.Namespace):
     )
 
 
-def _load_student_actor(policy, checkpoint: Path | None, device: torch.device):
-    from active_adaptation.learning.ppo.haic_actor import HaicStudentActor
-    from active_adaptation.vla.runtime import student_actor_from_policy
-
-    if checkpoint is None:
-        return student_actor_from_policy(policy, device)
-    actor = HaicStudentActor().to(device)
-    actor.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
-    actor.eval()
-    return actor
-
-
 @torch.inference_mode()
 def _bootstrap_collect(args, env, policy, simulation_app) -> dict[str, Any]:
     from active_adaptation.vla.runtime import (
         canonical_state,
-        privileged_target,
+        teacher_latent,
         refresh_rgb,
         teacher_action,
     )
@@ -164,7 +154,7 @@ def _bootstrap_collect(args, env, policy, simulation_app) -> dict[str, Any]:
         state = canonical_state(carry)
         if due.numel():
             rgb = refresh_rgb(env)
-            target = privileged_target(policy, carry)
+            target = teacher_latent(policy, carry)
             for slot in due.cpu().tolist():
                 rows_by_slot[slot].append(
                     {"state": state[slot].cpu().numpy(), "action": target[slot].cpu().numpy()}
@@ -217,14 +207,15 @@ def _bootstrap_collect(args, env, policy, simulation_app) -> dict[str, Any]:
         output_dir,
         {
             **result,
-            "schema_version": 1,
+            "schema_version": 2,
             "shard_format": "npz+mp4",
             "shard_root": "rollout_shards",
             "rows_unit": "decision_step",
             "env_fps": 50,
             "vla_fps": 10,
             "state_dim": 605,
-            "vla_action_dim": 275,
+            "vla_action_dim": 256,
+            "teacher_latent_dim": 256,
             "prompt": "Pull the cart along the reference motion.",
         },
     )
@@ -241,7 +232,7 @@ def _flush_dagger(output_dir: Path, shard_index: int, rows: list[dict[str, Any]]
     _encode_video([row["rgb"] for row in rows], video_path)
     arrays = {
         name: np.stack([row[name] for row in rows])
-        for name in ("state", "action", "actor_input", "teacher_action", "termination", "is_init")
+        for name in ("state", "action", "termination")
     }
     arrays["image_shape"] = rows[0]["rgb"].shape
     write_haic_dagger_shard(
@@ -259,15 +250,15 @@ def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
     from active_adaptation.vla.runtime import (
         canonical_state,
         predict_vla,
-        privileged_target,
+        teacher_latent,
         refresh_rgb,
-        teacher_action,
+        student_actor_from_policy,
     )
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     pool = _new_pool(args)
-    student = _load_student_actor(policy, args.student_actor_checkpoint, env.device)
+    actor = student_actor_from_policy(policy, env.device)
     carry = env.reset()
     latent = torch.zeros(env.num_envs, 256, device=env.device)
     rows: list[dict[str, Any]] = []
@@ -286,8 +277,8 @@ def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
                 row_count,
                 args.inference_batch_size,
             )
-            latent[:] = torch.from_numpy(predicted[:, :256]).to(env.device)
-            target = privileged_target(policy, carry)
+            latent[:] = torch.from_numpy(predicted).to(env.device)
+            target = teacher_latent(policy, carry)
             remaining = args.row_budget - row_count - len(rows)
             selected = slots[:remaining]
             row_data = {
@@ -295,32 +286,20 @@ def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
                     "rgb": rgb[slot].copy(),
                     "state": state[slot].detach().cpu().numpy().astype(np.float32),
                     "action": target[slot].cpu().numpy().astype(np.float32),
-                    "actor_input": [],
-                    "teacher_action": [],
                     "termination": [],
-                    "is_init": [],
-                    "after_termination": False,
                 }
                 for slot in selected
             }
             for _ in range(args.vla_cadence):
                 pre = carry.clone(False)
                 current_state = canonical_state(pre)
-                labels = teacher_action(policy, pre)
-                student_action = student(torch.cat((current_state, latent), dim=-1))
+                fixed_action = actor(torch.cat((current_state, latent), dim=-1))
                 action_td = pre.clone(False)
-                action_td["action"] = student_action
+                action_td["action"] = fixed_action
                 td, carry = env.step_and_maybe_reset(action_td)
                 done = td["next", "done"].squeeze(-1)
                 for slot in selected:
-                    row_data[slot]["actor_input"].append(current_state[slot].cpu().numpy())
-                    row_data[slot]["teacher_action"].append(labels[slot].cpu().numpy())
                     row_data[slot]["termination"].append(bool(done[slot].item()))
-                    row_data[slot]["is_init"].append(
-                        row_data[slot]["after_termination"]
-                        or bool(pre["is_init"][slot].item())
-                    )
-                    row_data[slot]["after_termination"] |= bool(done[slot].item())
                 reset_ids = done.nonzero(as_tuple=False).flatten()
                 if reset_ids.numel():
                     rgb_reset = refresh_rgb(env)
@@ -333,13 +312,9 @@ def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
                         row_count,
                         args.inference_batch_size,
                     )
-                    latent[reset_ids] = torch.from_numpy(reset_output[:, :256]).to(env.device)
+                    latent[reset_ids] = torch.from_numpy(reset_output).to(env.device)
             for slot in selected:
-                del row_data[slot]["after_termination"]
-                row_data[slot]["actor_input"] = np.asarray(row_data[slot]["actor_input"], dtype=np.float32)
-                row_data[slot]["teacher_action"] = np.asarray(row_data[slot]["teacher_action"], dtype=np.float32)
                 row_data[slot]["termination"] = np.asarray(row_data[slot]["termination"], dtype=bool)
-                row_data[slot]["is_init"] = np.asarray(row_data[slot]["is_init"], dtype=bool)
                 rows.append(row_data[slot])
             if len(rows) >= args.dagger_shard_rows:
                 count = args.dagger_shard_rows
@@ -360,14 +335,14 @@ def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
         "row_budget": args.row_budget,
         "control_repeat": args.vla_cadence,
         "state_dim": 605,
-        "vla_action_dim": 275,
-        "teacher_action_dim": 23,
+        "vla_action_dim": 256,
+        "teacher_latent_dim": 256,
     }
     _write_metadata(
         output_dir,
         {
             **result,
-            "schema_version": 1,
+            "schema_version": 2,
             "shard_format": "npz+mp4",
             "shard_root": "rollout_shards/train",
             "rows_unit": "decision_step",
@@ -384,10 +359,15 @@ def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
 
 @torch.inference_mode()
 def _dagger_eval(args, env, policy, simulation_app) -> dict[str, Any]:
-    from active_adaptation.vla.runtime import canonical_state, predict_vla, refresh_rgb
+    from active_adaptation.vla.runtime import (
+        canonical_state,
+        predict_vla,
+        refresh_rgb,
+        student_actor_from_policy,
+    )
 
     pool = _new_pool(args)
-    student = _load_student_actor(policy, args.student_actor_checkpoint, env.device)
+    actor = student_actor_from_policy(policy, env.device)
     carry = env.reset()
     phase = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
     latent = torch.zeros(env.num_envs, 256, device=env.device)
@@ -407,9 +387,9 @@ def _dagger_eval(args, env, policy, simulation_app) -> dict[str, Any]:
                     step,
                     args.inference_batch_size,
                 )
-                latent[due] = torch.from_numpy(predicted[:, :256]).to(env.device)
+                latent[due] = torch.from_numpy(predicted).to(env.device)
             action_td = carry.clone(False)
-            action_td["action"] = student(
+            action_td["action"] = actor(
                 torch.cat((canonical_state(carry), latent), dim=-1)
             )
             td, carry = env.step_and_maybe_reset(action_td)

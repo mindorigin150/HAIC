@@ -1,15 +1,11 @@
-"""Pure-PyTorch HAIC student actor.
+"""Pure-PyTorch wrapper for the native HAIC ``actor_adapt`` controller.
 
 This module deliberately has no TensorDict, TorchRL, Isaac Lab, or HAIC
-runtime imports.  It is used by the GR00T process as the small trainable
-controller after the VLA latent, and by :mod:`ppo_haic` through the aliases
-below to keep the native policy implementation unchanged.
+runtime imports so the VLA runtime can execute a fixed copy of the controller.
 """
 
 from __future__ import annotations
 
-import argparse
-from pathlib import Path
 from typing import Mapping
 
 import torch
@@ -151,33 +147,3 @@ def extract_actor_adapt_state_dict(
         target_key: policy_state[source_key]
         for target_key, source_key in _ACTOR_ADAPT_KEYS.items()
     }
-
-
-def load_actor_adapt(
-    checkpoint_path: str | Path,
-    *,
-    device: torch.device | str = "cpu",
-) -> HaicStudentActor:
-    """Load ``policy.actor_adapt`` from a native HAIC checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    actor = HaicStudentActor().to(device)
-    actor.load_state_dict(
-        extract_actor_adapt_state_dict(checkpoint["policy"]["actor_adapt"])
-    )
-    actor.eval()
-    return actor
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Export the HAIC actor_adapt state")
-    parser.add_argument("checkpoint", type=Path)
-    parser.add_argument("output", type=Path)
-    args = parser.parse_args()
-    actor = load_actor_adapt(args.checkpoint)
-    temporary = args.output.with_suffix(".pt.tmp")
-    torch.save(actor.state_dict(), temporary)
-    temporary.replace(args.output)
-
-
-if __name__ == "__main__":
-    main()

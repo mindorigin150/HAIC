@@ -30,10 +30,10 @@ def _teacher_encoded(policy, tensordict):
 
 
 @torch.inference_mode()
-def privileged_target(policy, tensordict) -> torch.Tensor:
-    """Return the 256D privileged latent + 19D object target."""
+def teacher_latent(policy, tensordict) -> torch.Tensor:
+    """Return the 256D privileged latent consumed by the HAIC actor."""
     encoded = _teacher_encoded(policy, tensordict)
-    return torch.cat((encoded["priv_feature"], encoded["object_"]), dim=-1)
+    return encoded["priv_feature"]
 
 
 @torch.inference_mode()
@@ -49,7 +49,7 @@ def student_actor_from_policy(policy, device: torch.device) -> HaicStudentActor:
     actor.load_state_dict(
         extract_actor_adapt_state_dict(policy.actor_adapt.state_dict())
     )
-    actor.eval()
+    actor.requires_grad_(False).eval()
     return actor
 
 
@@ -103,7 +103,7 @@ def predict_vla(
     step: int,
     batch_size: int,
 ) -> np.ndarray:
-    """Predict one 275D output per requested environment slot."""
+    """Predict one 256D teacher-latent output per requested environment slot."""
     actions = []
     for start in range(0, len(slots), batch_size):
         observations = vla_observations(
