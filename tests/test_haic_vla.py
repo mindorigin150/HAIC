@@ -19,7 +19,11 @@ from active_adaptation.learning.ppo.haic_actor import (
     extract_actor_adapt_state_dict,
     load_actor_adapt,
 )
-from active_adaptation.vla.runtime import student_actor_from_policy, teacher_latent
+from active_adaptation.vla.runtime import (
+    student_actor_from_policy,
+    teacher_latent,
+    vla_observations,
+)
 from active_adaptation.vla import runtime
 
 
@@ -79,6 +83,45 @@ class _EncodedTensorDict(dict):
 
 
 class HaicVlaContractTest(unittest.TestCase):
+    def test_rgb_frames_compacts_noncontiguous_slots(self):
+        output = torch.arange(8 * 1 * 1 * 4, dtype=torch.uint8).reshape(8, 1, 1, 4)
+        env = SimpleNamespace(
+            base_env=SimpleNamespace(
+                scene={
+                    "vla_camera": SimpleNamespace(
+                        data=SimpleNamespace(output={"rgb": output})
+                    )
+                }
+            )
+        )
+
+        frames = runtime.rgb_frames(env, [2, 7])
+
+        self.assertEqual(frames.shape, (2, 1, 1, 3))
+        np.testing.assert_array_equal(frames[0], output[2, ..., :3].numpy())
+        np.testing.assert_array_equal(frames[1], output[7, ..., :3].numpy())
+
+    def test_vla_observations_keep_global_ids_for_compact_slots(self):
+        rgb = np.asarray(
+            [
+                [[[1, 2, 3]]],
+                [[[4, 5, 6]]],
+            ],
+            dtype=np.uint8,
+        )
+        state = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+
+        observations = vla_observations(rgb, state, [2, 7], 11)
+
+        self.assertEqual([item.metadata["slot_id"] for item in observations], [2, 7])
+        np.testing.assert_array_equal(
+            observations[0].metadata["env_raw_rgb_frame_stack"], rgb[0][None]
+        )
+        np.testing.assert_array_equal(
+            observations[1].metadata["haic_state"], state[1]
+        )
+        self.assertIsNone(observations[0].data)
+
     def test_teacher_latent_is_only_the_consumed_privileged_feature(self):
         policy = SimpleNamespace(
             object_transform=lambda encoded: None,
@@ -157,6 +200,68 @@ class HaicVlaContractTest(unittest.TestCase):
                 self.assertEqual(payload["actor_input"].shape, (1, 5, 605))
                 self.assertEqual(payload["teacher_action"].shape, (1, 5, 23))
                 self.assertEqual(payload["termination"].shape, (1, 5))
+
+    def test_dagger_collect_refreshes_resets_only_before_the_final_repeat(self):
+        class Env:
+            num_envs = 1
+            device = torch.device("cpu")
+
+            def reset(self):
+                return _FakeTensorDict()
+
+            def step_and_maybe_reset(self, _action):
+                return (
+                    _FakeTensorDict(
+                        {"next": _FakeTensorDict({"done": torch.ones(1, 1, dtype=torch.bool)})}
+                    ),
+                    self.reset(),
+                )
+
+        args = SimpleNamespace(
+            output_dir=Path(),
+            mode="dagger-collect",
+            row_budget=1,
+            dagger_shard_rows=10,
+            dagger_round=0,
+            vla_cadence=2,
+            inference_batch_size=1,
+        )
+        refresh_calls = []
+
+        def refresh_rgb(_env, slots=None):
+            refresh_calls.append(slots)
+            count = 1 if slots is None else len(slots)
+            return np.zeros((count, 1, 1, 3), dtype=np.uint8)
+
+        def predict_vla(_pool, _rgb, _state, slots, _step, _batch_size):
+            return np.zeros((len(slots), 256), dtype=np.float32)
+
+        with patch.object(haic_vla, "_new_pool", return_value=_FakePool()), patch.object(
+            haic_vla, "_flush_dagger", return_value=0.0
+        ), patch.object(
+            runtime, "canonical_state", return_value=torch.zeros(1, 605)
+        ), patch.object(
+            runtime, "refresh_rgb", side_effect=refresh_rgb
+        ), patch.object(
+            runtime, "predict_vla", side_effect=predict_vla
+        ), patch.object(
+            runtime, "teacher_latent", return_value=torch.zeros(1, 256)
+        ), patch.object(
+            runtime, "teacher_action", return_value=torch.zeros(1, 23)
+        ), patch.object(
+            runtime, "student_actor_from_policy", return_value=_FakeActor()
+        ):
+            with tempfile.TemporaryDirectory() as output_dir:
+                args.output_dir = Path(output_dir)
+                result = haic_vla._dagger_collect(
+                    args,
+                    Env(),
+                    SimpleNamespace(),
+                    SimpleNamespace(is_running=lambda: True),
+                )
+
+        self.assertEqual(refresh_calls, [None, [0]])
+        self.assertEqual(result["rows"], 1)
 
     def test_dagger_eval_counts_only_first_done_per_env(self):
         env = _FakeEvalEnv([1, 2])

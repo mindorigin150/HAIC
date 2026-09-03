@@ -160,36 +160,41 @@ def _bootstrap_collect(args, env, policy, simulation_app) -> dict[str, Any]:
         state = canonical_state(carry)
         teacher = teacher_action(policy, carry)
         due = [slot for slot, row in enumerate(open_rows) if row is None]
+        state_cpu = state.detach().cpu().numpy().astype(np.float32, copy=False)
+        teacher_cpu = teacher.detach().cpu().numpy().astype(np.float32, copy=False)
         if due:
-            rgb = refresh_rgb(env)
+            rgb = refresh_rgb(env, due)
             target = teacher_latent(policy, carry)
-            for slot in due:
+            target_cpu = target.detach().cpu().numpy().astype(np.float32, copy=False)
+            for index, slot in enumerate(due):
                 open_rows[slot] = {
-                    "state": state[slot].cpu().numpy(),
-                    "action": target[slot].cpu().numpy(),
+                    "state": state_cpu[slot],
+                    "action": target_cpu[slot],
                     "actor_input": [],
                     "teacher_action": [],
                     "termination": [],
                 }
-                frames_by_slot[slot].append(rgb[slot].copy())
+                frames_by_slot[slot].append(rgb[index].copy())
 
         for slot, row in enumerate(open_rows):
             if row is not None:
-                row["actor_input"].append(state[slot].cpu().numpy())
-                row["teacher_action"].append(teacher[slot].cpu().numpy())
+                row["actor_input"].append(state_cpu[slot])
+                row["teacher_action"].append(teacher_cpu[slot])
 
         action_td = carry.clone(False)
         action_td["action"] = teacher
         td, carry = env.step_and_maybe_reset(action_td)
         done = td["next", "done"].squeeze(-1)
         success = td["next", "stats", "success"].squeeze(-1).bool()
+        done_cpu = done.cpu().numpy()
+        success_cpu = success.cpu().numpy()
         for slot, row in enumerate(open_rows):
             if row is None:
                 continue
-            row["termination"].append(bool(done[slot].item()))
-            if done[slot].item():
+            row["termination"].append(bool(done_cpu[slot]))
+            if done_cpu[slot]:
                 terminal_by_slot[slot] = True
-                success_by_slot[slot] = bool(success[slot].item())
+                success_by_slot[slot] = bool(success_cpu[slot])
             if len(row["termination"]) != args.vla_cadence:
                 continue
 
@@ -223,7 +228,6 @@ def _bootstrap_collect(args, env, policy, simulation_app) -> dict[str, Any]:
             frames_by_slot[slot] = []
             terminal_by_slot[slot] = False
             success_by_slot[slot] = False
-
     if accepted != target_episodes:
         raise RuntimeError(
             f"bootstrap collector stopped at {accepted}/{target_episodes} episodes"
@@ -311,31 +315,33 @@ def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
         while row_count + len(rows) < args.row_budget and simulation_app.is_running():
             rgb = refresh_rgb(env)
             state = canonical_state(carry)
+            state_cpu = state.detach().cpu().numpy().astype(np.float32, copy=False)
             slots = list(range(env.num_envs))
             predicted = predict_vla(
                 pool,
                 rgb,
-                state.detach().cpu().numpy(),
+                state_cpu,
                 slots,
                 row_count,
                 args.inference_batch_size,
             )
             latent[:] = torch.from_numpy(predicted).to(env.device)
             target = teacher_latent(policy, carry)
+            target_cpu = target.cpu().numpy().astype(np.float32, copy=False)
             remaining = args.row_budget - row_count - len(rows)
             selected = slots[:remaining]
             row_data = {
                 slot: {
                     "rgb": rgb[slot].copy(),
-                    "state": state[slot].detach().cpu().numpy().astype(np.float32),
-                    "action": target[slot].cpu().numpy().astype(np.float32),
+                    "state": state_cpu[slot],
+                    "action": target_cpu[slot],
                     "actor_input": [],
                     "teacher_action": [],
                     "termination": [],
                 }
                 for slot in selected
             }
-            for _ in range(args.vla_cadence):
+            for repeat_index in range(args.vla_cadence):
                 pre = carry.clone(False)
                 current_state = canonical_state(pre)
                 labels = teacher_action(policy, pre)
@@ -344,23 +350,32 @@ def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
                 action_td["action"] = fixed_action
                 td, carry = env.step_and_maybe_reset(action_td)
                 done = td["next", "done"].squeeze(-1)
+                current_state_cpu = current_state.cpu().numpy().astype(
+                    np.float32, copy=False
+                )
+                labels_cpu = labels.cpu().numpy().astype(np.float32, copy=False)
+                done_cpu = done.cpu().numpy()
                 for slot in selected:
                     row_data[slot]["actor_input"].append(
-                        current_state[slot].cpu().numpy().astype(np.float32)
+                        current_state_cpu[slot]
                     )
                     row_data[slot]["teacher_action"].append(
-                        labels[slot].cpu().numpy().astype(np.float32)
+                        labels_cpu[slot]
                     )
-                    row_data[slot]["termination"].append(bool(done[slot].item()))
+                    row_data[slot]["termination"].append(bool(done_cpu[slot]))
                 reset_ids = done.nonzero(as_tuple=False).flatten()
-                if reset_ids.numel():
-                    rgb_reset = refresh_rgb(env)
+                if repeat_index + 1 < args.vla_cadence and reset_ids.numel():
+                    reset_slots = reset_ids.cpu().tolist()
+                    rgb_reset = refresh_rgb(env, reset_slots)
                     reset_state = canonical_state(carry)
+                    reset_state_cpu = reset_state[reset_ids].cpu().numpy().astype(
+                        np.float32, copy=False
+                    )
                     reset_output = predict_vla(
                         pool,
                         rgb_reset,
-                        reset_state.detach().cpu().numpy(),
-                        reset_ids.cpu().tolist(),
+                        reset_state_cpu,
+                        reset_slots,
                         row_count,
                         args.inference_batch_size,
                     )
@@ -440,13 +455,14 @@ def _dagger_eval(args, env, policy, simulation_app) -> dict[str, Any]:
         for step in range(args.max_steps):
             due = ((phase == 0) & ~completed).nonzero(as_tuple=False).flatten()
             if due.numel():
-                rgb = refresh_rgb(env)
+                due_slots = due.cpu().tolist()
+                rgb = refresh_rgb(env, due_slots)
                 state = canonical_state(carry)
                 predicted = predict_vla(
                     pool,
                     rgb,
-                    state.cpu().numpy(),
-                    due.cpu().tolist(),
+                    state[due].cpu().numpy(),
+                    due_slots,
                     step,
                     args.inference_batch_size,
                 )

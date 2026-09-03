@@ -53,21 +53,28 @@ def student_actor_from_policy(policy, device: torch.device) -> HaicStudentActor:
     return actor
 
 
-def rgb_frames(env) -> np.ndarray:
-    """Read the latest batched RGB frame from the dedicated VLA camera."""
+def rgb_frames(env, slot_ids: list[int] | None = None) -> np.ndarray:
+    """Read the latest RGB frames, compacting partial reads in slot order."""
     camera = env.base_env.scene["vla_camera"]
     output = camera.data.output["rgb"]
-    return output[..., :3].detach().cpu().numpy().astype(np.uint8, copy=False)
+    if slot_ids is None:
+        return output[..., :3].detach().cpu().numpy().astype(np.uint8, copy=False)
+
+    return output[slot_ids][..., :3].detach().cpu().numpy().astype(
+        np.uint8, copy=False
+    )
 
 
-def refresh_rgb(env) -> np.ndarray:
-    """Render and force the 10Hz camera buffer before a VLA request."""
+def refresh_rgb(
+    env, slot_ids: list[int] | None = None
+) -> np.ndarray:
+    """Render all cameras, then transfer only requested slots to the host."""
     env.base_env.sim.render()
     env.base_env.scene["vla_camera"].update(
         1.0 / HAIC_VLA_HZ,
         force_recompute=True,
     )
-    return rgb_frames(env)
+    return rgb_frames(env, slot_ids)
 
 
 def vla_observations(
@@ -82,16 +89,16 @@ def vla_observations(
 
     return [
         Observation(
-            data=rgb[slot],
+            data=None,
             env_step=control_step,
             sim_time_ms=control_step * 20.0,
             metadata={
-                ENV_RAW_RGB_FRAME_STACK_INFO_KEY: rgb[slot][None],
-                "haic_state": state[slot],
+                ENV_RAW_RGB_FRAME_STACK_INFO_KEY: frame[None],
+                "haic_state": state_value,
                 "slot_id": slot,
             },
         )
-        for slot in slots
+        for frame, state_value, slot in zip(rgb, state, slots)
     ]
 
 
