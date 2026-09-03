@@ -1,16 +1,75 @@
 from __future__ import annotations
 
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import numpy as np
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from scripts import haic_vla
 from active_adaptation.learning.ppo.haic_actor import (
     HaicStudentActor,
     _ACTOR_ADAPT_KEYS,
     extract_actor_adapt_state_dict,
 )
 from active_adaptation.vla.runtime import student_actor_from_policy, teacher_latent
+from active_adaptation.vla import runtime
+
+
+class _FakeTensorDict(dict):
+    def __getitem__(self, key):
+        if isinstance(key, tuple):
+            value = self
+            for part in key:
+                value = dict.__getitem__(value, part)
+            return value
+        return super().__getitem__(key)
+
+    def clone(self, _):
+        return _FakeTensorDict(self)
+
+
+class _FakeEvalEnv:
+    device = torch.device("cpu")
+
+    def __init__(self, done_steps):
+        self.done_steps = done_steps
+        self.num_envs = len(done_steps)
+        self.step_count = 0
+        self.events = []
+        self.base_env = SimpleNamespace(eval=lambda: self.events.append("eval"))
+
+    def reset(self):
+        self.events.append("reset")
+        return _FakeTensorDict()
+
+    def step_and_maybe_reset(self, _action):
+        self.step_count += 1
+        done = torch.tensor(
+            [self.step_count >= done_step for done_step in self.done_steps]
+        ).unsqueeze(-1)
+        return (
+            _FakeTensorDict(
+                {"next": _FakeTensorDict({"done": done, "stats": {"success": done}})}
+            ),
+            self.reset(),
+        )
+
+
+class _FakePool:
+    def close(self):
+        pass
+
+
+class _FakeActor:
+    def __call__(self, actor_input):
+        return torch.zeros(actor_input.shape[0], 23)
 
 
 class _EncodedTensorDict(dict):
@@ -58,6 +117,72 @@ class HaicVlaContractTest(unittest.TestCase):
             for target_key, source_key in _ACTOR_ADAPT_KEYS.items()
         }
         actor.load_state_dict(extract_actor_adapt_state_dict(native_state))
+
+    def test_dagger_eval_counts_only_first_done_per_env(self):
+        env = _FakeEvalEnv([1, 2])
+        prediction_slots = []
+
+        def predict_vla(_pool, _rgb, _state, slots, _step, _batch_size):
+            prediction_slots.append(tuple(slots))
+            return np.zeros((len(slots), 256), dtype=np.float32)
+
+        args = SimpleNamespace(
+            max_steps=3,
+            output_dir=Path(),
+            mode="dagger-eval",
+            vla_cadence=1,
+            inference_batch_size=2,
+        )
+        with patch.object(haic_vla, "_new_pool", return_value=_FakePool()), patch.object(
+            runtime, "canonical_state", return_value=torch.zeros(2, 2)
+        ), patch.object(
+            runtime,
+            "refresh_rgb",
+            return_value=np.zeros((2, 1, 1, 3), dtype=np.uint8),
+        ), patch.object(runtime, "predict_vla", side_effect=predict_vla), patch.object(
+            runtime, "student_actor_from_policy", return_value=_FakeActor()
+        ):
+            with tempfile.TemporaryDirectory() as output_dir:
+                args.output_dir = Path(output_dir)
+                result = haic_vla._dagger_eval(
+                    args, env, SimpleNamespace(), SimpleNamespace()
+                )
+                self.assertEqual(result["episodes"], 2)
+                self.assertEqual(result["successes"], 2)
+                self.assertEqual(result["success_rate"], 1.0)
+                self.assertNotIn("steps", result)
+                self.assertEqual(prediction_slots, [(0, 1), (1,)])
+                self.assertEqual(env.events[:2], ["eval", "reset"])
+
+    def test_dagger_eval_does_not_write_partial_result(self):
+        env = _FakeEvalEnv([1, 3])
+
+        def predict_vla(_pool, _rgb, _state, slots, _step, _batch_size):
+            return np.zeros((len(slots), 256), dtype=np.float32)
+
+        args = SimpleNamespace(
+            max_steps=2,
+            output_dir=Path(),
+            mode="dagger-eval",
+            vla_cadence=1,
+            inference_batch_size=2,
+        )
+        with patch.object(haic_vla, "_new_pool", return_value=_FakePool()), patch.object(
+            runtime, "canonical_state", return_value=torch.zeros(2, 2)
+        ), patch.object(
+            runtime,
+            "refresh_rgb",
+            return_value=np.zeros((2, 1, 1, 3), dtype=np.uint8),
+        ), patch.object(
+            runtime,
+            "predict_vla",
+            side_effect=predict_vla,
+        ), patch.object(runtime, "student_actor_from_policy", return_value=_FakeActor()):
+            with tempfile.TemporaryDirectory() as output_dir:
+                args.output_dir = Path(output_dir)
+                with self.assertRaisesRegex(RuntimeError, "1/2 episodes"):
+                    haic_vla._dagger_eval(args, env, SimpleNamespace(), SimpleNamespace())
+                self.assertFalse((args.output_dir / "dagger-eval.json").exists())
 
 if __name__ == "__main__":
     unittest.main()

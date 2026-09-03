@@ -368,14 +368,16 @@ def _dagger_eval(args, env, policy, simulation_app) -> dict[str, Any]:
 
     pool = _new_pool(args)
     actor = student_actor_from_policy(policy, env.device)
+    env.base_env.eval()
     carry = env.reset()
     phase = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
     latent = torch.zeros(env.num_envs, 256, device=env.device)
+    completed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     done_count = 0
     success_count = 0
     try:
         for step in range(args.max_steps):
-            due = (phase == 0).nonzero(as_tuple=False).flatten()
+            due = ((phase == 0) & ~completed).nonzero(as_tuple=False).flatten()
             if due.numel():
                 rgb = refresh_rgb(env)
                 state = canonical_state(carry)
@@ -395,15 +397,22 @@ def _dagger_eval(args, env, policy, simulation_app) -> dict[str, Any]:
             td, carry = env.step_and_maybe_reset(action_td)
             done = td["next", "done"].squeeze(-1)
             success = td["next", "stats", "success"].squeeze(-1).bool()
-            done_count += int(done.sum().item())
-            success_count += int((done & success).sum().item())
+            first_done = done & ~completed
+            done_count += int(first_done.sum().item())
+            success_count += int((first_done & success).sum().item())
+            completed |= done
             phase.add_(1).remainder_(args.vla_cadence)
             phase[done] = 0
+            if completed.all():
+                break
     finally:
         pool.close()
+    if not completed.all():
+        raise RuntimeError(
+            f"dagger evaluator stopped at {done_count}/{env.num_envs} episodes"
+        )
     result = {
         "mode": args.mode,
-        "steps": args.max_steps,
         "episodes": done_count,
         "successes": success_count,
         "success_rate": success_count / done_count,
