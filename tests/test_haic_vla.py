@@ -136,7 +136,9 @@ class HaicVlaContractTest(unittest.TestCase):
             )
             return [
                 SimpleNamespace(
-                    action=SimpleNamespace(value=item.metadata["haic_state"])
+                    action_chunk=np.repeat(
+                        item.metadata["haic_state"][None], 40, axis=0
+                    ),
                 )
                 for item in observations
             ]
@@ -150,7 +152,9 @@ class HaicVlaContractTest(unittest.TestCase):
             batch_size=2,
         )
 
-        np.testing.assert_array_equal(output[:, 0], np.arange(5))
+        np.testing.assert_array_equal(
+            output[:, :, 0], np.repeat(np.arange(5)[:, None], 40, axis=1)
+        )
         self.assertEqual(
             seen,
             [(2, 0, 0), (7, 1, 1), (11, 2, 2), (19, 3, 3), (23, 4, 4)],
@@ -211,14 +215,14 @@ class HaicVlaContractTest(unittest.TestCase):
         for name, parameter in actor.state_dict().items():
             torch.testing.assert_close(parameter, exported.state_dict()[name])
 
-    def test_dagger_flush_preserves_action_distillation_window(self):
+    def test_dagger_flush_preserves_per_step_action_distillation(self):
         row = {
             "rgb": np.zeros((2, 2, 3), dtype=np.uint8),
             "state": np.zeros(605, dtype=np.float32),
             "action": np.zeros(256, dtype=np.float32),
-            "actor_input": np.zeros((5, 605), dtype=np.float32),
-            "teacher_action": np.zeros((5, 23), dtype=np.float32),
-            "termination": np.asarray([False, False, False, False, True]),
+            "actor_input": np.zeros(605, dtype=np.float32),
+            "teacher_action": np.zeros(23, dtype=np.float32),
+            "termination": np.asarray(False),
         }
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
@@ -231,11 +235,12 @@ class HaicVlaContractTest(unittest.TestCase):
             with np.load(
                 output / "rollout_shards/train/episode_000000/episode.npz"
             ) as payload:
-                self.assertEqual(payload["actor_input"].shape, (1, 5, 605))
-                self.assertEqual(payload["teacher_action"].shape, (1, 5, 23))
-                self.assertEqual(payload["termination"].shape, (1, 5))
+                self.assertEqual(payload["actor_input"].shape, (1, 605))
+                self.assertEqual(payload["teacher_action"].shape, (1, 23))
+                self.assertEqual(payload["termination"].shape, (1,))
+                self.assertTrue(payload["termination"][0])
 
-    def test_dagger_collect_refreshes_resets_only_before_the_final_repeat(self):
+    def test_dagger_collect_refreshes_each_control_step_at_50hz(self):
         class Env:
             num_envs = 1
             device = torch.device("cpu")
@@ -255,20 +260,19 @@ class HaicVlaContractTest(unittest.TestCase):
             output_dir=Path(),
             mode="dagger-collect",
             row_budget=1,
-            dagger_shard_rows=10,
             dagger_round=0,
             vla_cadence=2,
             inference_batch_size=1,
         )
         refresh_calls = []
 
-        def refresh_rgb(_env, slots=None):
-            refresh_calls.append(slots)
+        def refresh_rgb(_env, slots=None, *, update_hz=10):
+            refresh_calls.append((slots, update_hz))
             count = 1 if slots is None else len(slots)
             return np.zeros((count, 1, 1, 3), dtype=np.uint8)
 
         def predict_vla(_pool, _rgb, _state, slots, _step, _batch_size):
-            return np.zeros((len(slots), 256), dtype=np.float32)
+            return np.zeros((len(slots), 40, 256), dtype=np.float32)
 
         with patch.object(haic_vla, "_new_pool", return_value=_FakePool()), patch.object(
             haic_vla, "_flush_dagger", return_value=0.0
@@ -294,7 +298,7 @@ class HaicVlaContractTest(unittest.TestCase):
                     SimpleNamespace(is_running=lambda: True),
                 )
 
-        self.assertEqual(refresh_calls, [None, [0]])
+        self.assertEqual(refresh_calls, [(None, 50)])
         self.assertEqual(result["rows"], 1)
 
     def test_dagger_eval_counts_only_first_done_per_env(self):
@@ -303,7 +307,7 @@ class HaicVlaContractTest(unittest.TestCase):
 
         def predict_vla(_pool, _rgb, _state, slots, _step, _batch_size):
             prediction_slots.append(tuple(slots))
-            return np.zeros((len(slots), 256), dtype=np.float32)
+            return np.zeros((len(slots), 40, 256), dtype=np.float32)
 
         args = SimpleNamespace(
             max_steps=3,
@@ -333,11 +337,46 @@ class HaicVlaContractTest(unittest.TestCase):
                 self.assertEqual(prediction_slots, [(0, 1), (1,)])
                 self.assertEqual(env.events[:2], ["eval", "reset"])
 
+    def test_dagger_eval_consumes_distinct_action_chunk_steps(self):
+        env = _FakeEvalEnv([3])
+        consumed = []
+
+        class RecordingActor:
+            def __call__(self, actor_input):
+                consumed.append(actor_input[:, 605:].clone())
+                return torch.zeros(actor_input.shape[0], 23)
+
+        def predict_vla(_pool, _rgb, _state, slots, _step, _batch_size):
+            chunk = np.arange(40, dtype=np.float32)[:, None]
+            return np.repeat(np.repeat(chunk[None], len(slots), axis=0), 256, axis=2)
+
+        args = SimpleNamespace(
+            max_steps=3,
+            output_dir=Path(),
+            mode="dagger-eval",
+            vla_cadence=5,
+            inference_batch_size=1,
+        )
+        with patch.object(haic_vla, "_new_pool", return_value=_FakePool()), patch.object(
+            runtime, "canonical_state", return_value=torch.zeros(1, 605)
+        ), patch.object(
+            runtime,
+            "refresh_rgb",
+            return_value=np.zeros((1, 1, 1, 3), dtype=np.uint8),
+        ), patch.object(runtime, "predict_vla", side_effect=predict_vla), patch.object(
+            runtime, "student_actor_from_policy", return_value=RecordingActor()
+        ):
+            with tempfile.TemporaryDirectory() as output_dir:
+                args.output_dir = Path(output_dir)
+                haic_vla._dagger_eval(args, env, SimpleNamespace(), SimpleNamespace())
+
+        self.assertEqual([int(item[0, 0].item()) for item in consumed], [0, 1, 2])
+
     def test_dagger_eval_does_not_write_partial_result(self):
         env = _FakeEvalEnv([1, 3])
 
         def predict_vla(_pool, _rgb, _state, slots, _step, _batch_size):
-            return np.zeros((len(slots), 256), dtype=np.float32)
+            return np.zeros((len(slots), 40, 256), dtype=np.float32)
 
         args = SimpleNamespace(
             max_steps=2,

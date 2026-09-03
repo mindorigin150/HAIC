@@ -15,6 +15,9 @@ from active_adaptation.learning.ppo.haic_actor import (
 
 
 HAIC_VLA_HZ = 10
+HAIC_CONTROL_HZ = 50
+HAIC_ACTION_HORIZON = 40
+HAIC_LATENT_DIM = 256
 
 
 def canonical_state(tensordict) -> torch.Tensor:
@@ -66,12 +69,15 @@ def rgb_frames(env, slot_ids: list[int] | None = None) -> np.ndarray:
 
 
 def refresh_rgb(
-    env, slot_ids: list[int] | None = None
+    env,
+    slot_ids: list[int] | None = None,
+    *,
+    update_hz: int = HAIC_VLA_HZ,
 ) -> np.ndarray:
     """Render all cameras, then transfer only requested slots to the host."""
     env.base_env.sim.render()
     env.base_env.scene["vla_camera"].update(
-        1.0 / HAIC_VLA_HZ,
+        1.0 / update_hz,
         force_recompute=True,
     )
     return rgb_frames(env, slot_ids)
@@ -110,7 +116,7 @@ def predict_vla(
     step: int,
     batch_size: int,
 ) -> np.ndarray:
-    """Predict one 256D teacher-latent output per requested environment slot."""
+    """Predict one GR00T action chunk per requested environment slot."""
     actions = []
     for start in range(0, len(slots), batch_size):
         batch = slice(start, start + batch_size)
@@ -118,7 +124,7 @@ def predict_vla(
             rgb[batch], state[batch], slots[batch], step
         )
         actions.extend(
-            np.asarray(output.action.value, dtype=np.float32)
+            np.asarray(output.action_chunk, dtype=np.float32)
             for output in pool.predict_batch(observations)
         )
     return np.stack(actions)

@@ -44,7 +44,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dagger-round", type=int, default=0)
     parser.add_argument("--vla-cadence", type=int, default=5)
     parser.add_argument("--row-budget", type=int, default=32_000)
-    parser.add_argument("--dagger-shard-rows", type=int, default=1_000)
     parser.add_argument("--config-dir", type=Path)
     AppLauncher.add_app_launcher_args(parser)
     return parser.parse_args()
@@ -95,7 +94,7 @@ def _encode_video(frames: list[np.ndarray], path: Path) -> None:
             "-video_size",
             f"{frame.shape[1]}x{frame.shape[0]}",
             "-framerate",
-            "10",
+            "50",
             "-i",
             "pipe:0",
             "-an",
@@ -137,6 +136,7 @@ def _new_pool(args: argparse.Namespace):
 @torch.inference_mode()
 def _bootstrap_collect(args, env, policy, simulation_app) -> dict[str, Any]:
     from active_adaptation.vla.runtime import (
+        HAIC_CONTROL_HZ,
         canonical_state,
         teacher_latent,
         refresh_rgb,
@@ -150,70 +150,52 @@ def _bootstrap_collect(args, env, policy, simulation_app) -> dict[str, Any]:
     accepted = 0
     episode_index = 0
     carry = env.reset()
-    open_rows: list[dict[str, Any] | None] = [None for _ in range(env.num_envs)]
     rows_by_slot: list[list[dict[str, Any]]] = [[] for _ in range(env.num_envs)]
-    frames_by_slot: list[list[np.ndarray]] = [[] for _ in range(env.num_envs)]
-    terminal_by_slot = [False for _ in range(env.num_envs)]
-    success_by_slot = [False for _ in range(env.num_envs)]
 
     while accepted < target_episodes and simulation_app.is_running():
         state = canonical_state(carry)
         teacher = teacher_action(policy, carry)
-        due = [slot for slot, row in enumerate(open_rows) if row is None]
+        target = teacher_latent(policy, carry)
+        rgb = refresh_rgb(env, update_hz=HAIC_CONTROL_HZ)
         state_cpu = state.detach().cpu().numpy().astype(np.float32, copy=False)
         teacher_cpu = teacher.detach().cpu().numpy().astype(np.float32, copy=False)
-        if due:
-            rgb = refresh_rgb(env, due)
-            target = teacher_latent(policy, carry)
-            target_cpu = target.detach().cpu().numpy().astype(np.float32, copy=False)
-            for index, slot in enumerate(due):
-                open_rows[slot] = {
-                    "state": state_cpu[slot],
-                    "action": target_cpu[slot],
-                    "actor_input": [],
-                    "teacher_action": [],
-                    "termination": [],
+        target_cpu = target.detach().cpu().numpy().astype(np.float32, copy=False)
+        for slot in range(env.num_envs):
+            rows_by_slot[slot].append(
+                {
+                    "rgb": rgb[slot].copy(),
+                    "state": state_cpu[slot].copy(),
+                    "action": target_cpu[slot].copy(),
+                    "actor_input": state_cpu[slot].copy(),
+                    "teacher_action": teacher_cpu[slot].copy(),
+                    "termination": False,
                 }
-                frames_by_slot[slot].append(rgb[index].copy())
-
-        for slot, row in enumerate(open_rows):
-            if row is not None:
-                row["actor_input"].append(state_cpu[slot])
-                row["teacher_action"].append(teacher_cpu[slot])
+            )
 
         action_td = carry.clone(False)
         action_td["action"] = teacher
         td, carry = env.step_and_maybe_reset(action_td)
         done = td["next", "done"].squeeze(-1)
         success = td["next", "stats", "success"].squeeze(-1).bool()
-        done_cpu = done.cpu().numpy()
-        success_cpu = success.cpu().numpy()
-        for slot, row in enumerate(open_rows):
-            if row is None:
-                continue
-            row["termination"].append(bool(done_cpu[slot]))
-            if done_cpu[slot]:
-                terminal_by_slot[slot] = True
-                success_by_slot[slot] = bool(success_cpu[slot])
-            if len(row["termination"]) != args.vla_cadence:
-                continue
-
-            rows_by_slot[slot].append(row)
-            open_rows[slot] = None
-            terminal = terminal_by_slot[slot]
-            if not terminal:
-                continue
-            if success_by_slot[slot] and accepted < target_episodes:
+        for slot in done.nonzero(as_tuple=False).flatten().cpu().tolist():
+            rows = rows_by_slot[slot]
+            rows[-1]["termination"] = True
+            if success[slot].item() and accepted < target_episodes:
                 shard = output_dir / f".bootstrap_{episode_index:06d}.mp4"
-                _encode_video(frames_by_slot[slot], shard)
+                _encode_video([row["rgb"] for row in rows], shard)
                 arrays = {
-                    "state": np.stack([item["state"] for item in rows_by_slot[slot]]).astype(np.float32),
-                    "action": np.stack([item["action"] for item in rows_by_slot[slot]]).astype(np.float32),
-                    "actor_input": np.stack([item["actor_input"] for item in rows_by_slot[slot]]).astype(np.float32),
-                    "teacher_action": np.stack([item["teacher_action"] for item in rows_by_slot[slot]]).astype(np.float32),
-                    "termination": np.stack([item["termination"] for item in rows_by_slot[slot]]),
-                    "image_shape": frames_by_slot[slot][0].shape,
+                    name: np.stack([item[name] for item in rows]).astype(np.float32)
+                    for name in (
+                        "state",
+                        "action",
+                        "actor_input",
+                        "teacher_action",
+                    )
                 }
+                arrays["termination"] = np.asarray(
+                    [item["termination"] for item in rows], dtype=bool
+                )
+                arrays["image_shape"] = rows[0]["rgb"].shape
                 write_haic_bootstrap_shard(
                     output_dir,
                     split=args.split,
@@ -225,9 +207,6 @@ def _bootstrap_collect(args, env, policy, simulation_app) -> dict[str, Any]:
                 accepted += 1
                 episode_index += 1
             rows_by_slot[slot] = []
-            frames_by_slot[slot] = []
-            terminal_by_slot[slot] = False
-            success_by_slot[slot] = False
     if accepted != target_episodes:
         raise RuntimeError(
             f"bootstrap collector stopped at {accepted}/{target_episodes} episodes"
@@ -244,18 +223,18 @@ def _bootstrap_collect(args, env, policy, simulation_app) -> dict[str, Any]:
         output_dir,
         {
             **result,
-            "schema_version": 3,
+            "schema_version": 4,
             "shard_format": "npz+mp4",
             "shard_root": "rollout_shards",
-            "rows_unit": "decision_step",
+            "rows_unit": "control_step",
             "env_fps": 50,
             "vla_fps": 10,
             "state_dim": 605,
             "vla_action_dim": 256,
             "teacher_latent_dim": 256,
-            "actor_input_shape": [5, 605],
-            "teacher_action_shape": [5, 23],
-            "termination_shape": [5],
+            "actor_input_shape": [605],
+            "teacher_action_shape": [23],
+            "termination_shape": [],
             "prompt": "Pull the cart along the reference motion.",
         },
     )
@@ -280,6 +259,7 @@ def _flush_dagger(output_dir: Path, shard_index: int, rows: list[dict[str, Any]]
             "termination",
         )
     }
+    arrays["termination"][-1] = True
     arrays["image_shape"] = rows[0]["rgb"].shape
     write_haic_dagger_shard(
         output_dir,
@@ -294,6 +274,9 @@ def _flush_dagger(output_dir: Path, shard_index: int, rows: list[dict[str, Any]]
 @torch.inference_mode()
 def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
     from active_adaptation.vla.runtime import (
+        HAIC_ACTION_HORIZON,
+        HAIC_CONTROL_HZ,
+        HAIC_LATENT_DIM,
         canonical_state,
         predict_vla,
         teacher_latent,
@@ -307,98 +290,76 @@ def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
     pool = _new_pool(args)
     actor = student_actor_from_policy(policy, env.device)
     carry = env.reset()
-    latent = torch.zeros(env.num_envs, 256, device=env.device)
-    rows: list[dict[str, Any]] = []
+    phase = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    action_chunk = torch.zeros(
+        env.num_envs, HAIC_ACTION_HORIZON, HAIC_LATENT_DIM, device=env.device
+    )
+    rows_by_slot: list[list[dict[str, Any]]] = [[] for _ in range(env.num_envs)]
     row_count = 0
+    control_step = 0
     shard_index = 0
     try:
-        while row_count + len(rows) < args.row_budget and simulation_app.is_running():
-            rgb = refresh_rgb(env)
+        while row_count < args.row_budget and simulation_app.is_running():
+            rgb = refresh_rgb(env, update_hz=HAIC_CONTROL_HZ)
             state = canonical_state(carry)
             state_cpu = state.detach().cpu().numpy().astype(np.float32, copy=False)
-            slots = list(range(env.num_envs))
-            predicted = predict_vla(
-                pool,
-                rgb,
-                state_cpu,
-                slots,
-                row_count,
-                args.inference_batch_size,
-            )
-            latent[:] = torch.from_numpy(predicted).to(env.device)
+            due = (phase == 0).nonzero(as_tuple=False).flatten()
+            if due.numel():
+                due_slots = due.cpu().tolist()
+                predicted = predict_vla(
+                    pool,
+                    rgb[due_slots],
+                    state_cpu[due.cpu().numpy()],
+                    due_slots,
+                    control_step,
+                    args.inference_batch_size,
+                )
+                action_chunk[due] = torch.from_numpy(predicted).to(env.device)
             target = teacher_latent(policy, carry)
             target_cpu = target.cpu().numpy().astype(np.float32, copy=False)
-            remaining = args.row_budget - row_count - len(rows)
-            selected = slots[:remaining]
-            row_data = {
-                slot: {
-                    "rgb": rgb[slot].copy(),
-                    "state": state_cpu[slot],
-                    "action": target_cpu[slot],
-                    "actor_input": [],
-                    "teacher_action": [],
-                    "termination": [],
-                }
-                for slot in selected
-            }
-            for repeat_index in range(args.vla_cadence):
-                pre = carry.clone(False)
-                current_state = canonical_state(pre)
-                labels = teacher_action(policy, pre)
-                fixed_action = actor(torch.cat((current_state, latent), dim=-1))
-                action_td = pre.clone(False)
-                action_td["action"] = fixed_action
-                td, carry = env.step_and_maybe_reset(action_td)
-                done = td["next", "done"].squeeze(-1)
-                current_state_cpu = current_state.cpu().numpy().astype(
-                    np.float32, copy=False
+            labels = teacher_action(policy, carry)
+            labels_cpu = labels.cpu().numpy().astype(np.float32, copy=False)
+            action_latent = action_chunk[
+                torch.arange(env.num_envs, device=env.device), phase
+            ]
+            fixed_action = actor(torch.cat((state, action_latent), dim=-1))
+            for slot in range(env.num_envs):
+                rows_by_slot[slot].append(
+                    {
+                        "rgb": rgb[slot].copy(),
+                        "state": state_cpu[slot].copy(),
+                        "action": target_cpu[slot].copy(),
+                        "actor_input": state_cpu[slot].copy(),
+                        "teacher_action": labels_cpu[slot].copy(),
+                        "termination": False,
+                    }
                 )
-                labels_cpu = labels.cpu().numpy().astype(np.float32, copy=False)
-                done_cpu = done.cpu().numpy()
-                for slot in selected:
-                    row_data[slot]["actor_input"].append(
-                        current_state_cpu[slot]
-                    )
-                    row_data[slot]["teacher_action"].append(
-                        labels_cpu[slot]
-                    )
-                    row_data[slot]["termination"].append(bool(done_cpu[slot]))
-                reset_ids = done.nonzero(as_tuple=False).flatten()
-                if repeat_index + 1 < args.vla_cadence and reset_ids.numel():
-                    reset_slots = reset_ids.cpu().tolist()
-                    rgb_reset = refresh_rgb(env, reset_slots)
-                    reset_state = canonical_state(carry)
-                    reset_state_cpu = reset_state[reset_ids].cpu().numpy().astype(
-                        np.float32, copy=False
-                    )
-                    reset_output = predict_vla(
-                        pool,
-                        rgb_reset,
-                        reset_state_cpu,
-                        reset_slots,
-                        row_count,
-                        args.inference_batch_size,
-                    )
-                    latent[reset_ids] = torch.from_numpy(reset_output).to(env.device)
-            for slot in selected:
-                row_data[slot]["actor_input"] = np.asarray(
-                    row_data[slot]["actor_input"], dtype=np.float32
-                )
-                row_data[slot]["teacher_action"] = np.asarray(
-                    row_data[slot]["teacher_action"], dtype=np.float32
-                )
-                row_data[slot]["termination"] = np.asarray(row_data[slot]["termination"], dtype=bool)
-                rows.append(row_data[slot])
-            if len(rows) >= args.dagger_shard_rows:
-                count = args.dagger_shard_rows
-                _flush_dagger(output_dir, shard_index, rows[:count])
-                rows = rows[count:]
-                row_count += count
-                shard_index += 1
+            action_td = carry.clone(False)
+            action_td["action"] = fixed_action
+            td, carry = env.step_and_maybe_reset(action_td)
+            done = td["next", "done"].squeeze(-1)
+            phase.add_(1).remainder_(args.vla_cadence)
+            phase[done] = 0
+            control_step += 1
+            for slot in done.nonzero(as_tuple=False).flatten().cpu().tolist():
+                episode_rows = rows_by_slot[slot]
+                episode_rows[-1]["termination"] = True
+                remaining = args.row_budget - row_count
+                if remaining:
+                    segment = episode_rows[:remaining]
+                    _flush_dagger(output_dir, shard_index, segment)
+                    row_count += len(segment)
+                    shard_index += 1
+                rows_by_slot[slot] = []
     finally:
-        if rows:
-            _flush_dagger(output_dir, shard_index, rows)
-            row_count += len(rows)
+        for episode_rows in rows_by_slot:
+            remaining = args.row_budget - row_count
+            if not episode_rows or not remaining:
+                continue
+            segment = episode_rows[:remaining]
+            _flush_dagger(output_dir, shard_index, segment)
+            row_count += len(segment)
+            shard_index += 1
         pool.close()
 
     result = {
@@ -410,18 +371,18 @@ def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
         "state_dim": 605,
         "vla_action_dim": 256,
         "teacher_latent_dim": 256,
-        "actor_input_shape": [5, 605],
-        "teacher_action_shape": [5, 23],
-        "termination_shape": [5],
+        "actor_input_shape": [605],
+        "teacher_action_shape": [23],
+        "termination_shape": [],
     }
     _write_metadata(
         output_dir,
         {
             **result,
-            "schema_version": 3,
+            "schema_version": 4,
             "shard_format": "npz+mp4",
             "shard_root": "rollout_shards/train",
-            "rows_unit": "decision_step",
+            "rows_unit": "control_step",
             "env_fps": 50,
             "vla_fps": 10,
             "prompt": "Pull the cart along the reference motion.",
@@ -436,6 +397,8 @@ def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
 @torch.inference_mode()
 def _dagger_eval(args, env, policy, simulation_app) -> dict[str, Any]:
     from active_adaptation.vla.runtime import (
+        HAIC_ACTION_HORIZON,
+        HAIC_LATENT_DIM,
         canonical_state,
         predict_vla,
         refresh_rgb,
@@ -447,7 +410,9 @@ def _dagger_eval(args, env, policy, simulation_app) -> dict[str, Any]:
     env.base_env.eval()
     carry = env.reset()
     phase = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
-    latent = torch.zeros(env.num_envs, 256, device=env.device)
+    action_chunk = torch.zeros(
+        env.num_envs, HAIC_ACTION_HORIZON, HAIC_LATENT_DIM, device=env.device
+    )
     completed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     done_count = 0
     success_count = 0
@@ -466,10 +431,13 @@ def _dagger_eval(args, env, policy, simulation_app) -> dict[str, Any]:
                     step,
                     args.inference_batch_size,
                 )
-                latent[due] = torch.from_numpy(predicted).to(env.device)
+                action_chunk[due] = torch.from_numpy(predicted).to(env.device)
+            action_latent = action_chunk[
+                torch.arange(env.num_envs, device=env.device), phase
+            ]
             action_td = carry.clone(False)
             action_td["action"] = actor(
-                torch.cat((canonical_state(carry), latent), dim=-1)
+                torch.cat((canonical_state(carry), action_latent), dim=-1)
             )
             td, carry = env.step_and_maybe_reset(action_td)
             done = td["next", "done"].squeeze(-1)
@@ -512,18 +480,13 @@ def _oracle_eval(args, env, policy, simulation_app) -> dict[str, Any]:
     actor = student_actor_from_policy(policy, env.device)
     env.base_env.eval()
     carry = env.reset()
-    phase = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
-    latent = torch.zeros(env.num_envs, 256, device=env.device)
     completed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     done_count = 0
     success_count = 0
     for _ in range(args.max_steps):
-        due = ((phase == 0) & ~completed).nonzero(as_tuple=False).flatten()
-        if due.numel():
-            target = teacher_latent(policy, carry)
-            latent[due] = target[due]
+        target = teacher_latent(policy, carry)
         action_td = carry.clone(False)
-        action_td["action"] = actor(torch.cat((canonical_state(carry), latent), dim=-1))
+        action_td["action"] = actor(torch.cat((canonical_state(carry), target), dim=-1))
         td, carry = env.step_and_maybe_reset(action_td)
         done = td["next", "done"].squeeze(-1)
         success = td["next", "stats", "success"].squeeze(-1).bool()
@@ -531,8 +494,6 @@ def _oracle_eval(args, env, policy, simulation_app) -> dict[str, Any]:
         done_count += int(first_done.sum().item())
         success_count += int((first_done & success).sum().item())
         completed |= done
-        phase.add_(1).remainder_(args.vla_cadence)
-        phase[done] = 0
         if completed.all():
             break
     if not completed.all():
