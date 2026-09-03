@@ -122,6 +122,40 @@ class HaicVlaContractTest(unittest.TestCase):
         )
         self.assertIsNone(observations[0].data)
 
+    def test_predict_vla_batches_compact_observations_with_their_slots(self):
+        seen = []
+
+        def predict_batch(observations):
+            seen.extend(
+                (
+                    item.metadata["slot_id"],
+                    item.metadata["haic_state"][0],
+                    item.metadata["env_raw_rgb_frame_stack"][0, 0, 0, 0],
+                )
+                for item in observations
+            )
+            return [
+                SimpleNamespace(
+                    action=SimpleNamespace(value=item.metadata["haic_state"])
+                )
+                for item in observations
+            ]
+
+        output = runtime.predict_vla(
+            SimpleNamespace(predict_batch=predict_batch),
+            np.arange(5, dtype=np.uint8).reshape(5, 1, 1, 1),
+            np.arange(5, dtype=np.float32).reshape(5, 1),
+            [2, 7, 11, 19, 23],
+            step=0,
+            batch_size=2,
+        )
+
+        np.testing.assert_array_equal(output[:, 0], np.arange(5))
+        self.assertEqual(
+            seen,
+            [(2, 0, 0), (7, 1, 1), (11, 2, 2), (19, 3, 3), (23, 4, 4)],
+        )
+
     def test_teacher_latent_is_only_the_consumed_privileged_feature(self):
         policy = SimpleNamespace(
             object_transform=lambda encoded: None,

@@ -113,8 +113,9 @@ def predict_vla(
     """Predict one 256D teacher-latent output per requested environment slot."""
     actions = []
     for start in range(0, len(slots), batch_size):
+        batch = slice(start, start + batch_size)
         observations = vla_observations(
-            rgb, state, slots[start : start + batch_size], step
+            rgb[batch], state[batch], slots[batch], step
         )
         actions.extend(
             np.asarray(output.action.value, dtype=np.float32)
