@@ -17,6 +17,7 @@ from active_adaptation.learning.ppo.haic_actor import (
     HaicStudentActor,
     _ACTOR_ADAPT_KEYS,
     extract_actor_adapt_state_dict,
+    load_actor_adapt,
 )
 from active_adaptation.vla.runtime import student_actor_from_policy, teacher_latent
 from active_adaptation.vla import runtime
@@ -118,6 +119,45 @@ class HaicVlaContractTest(unittest.TestCase):
         }
         actor.load_state_dict(extract_actor_adapt_state_dict(native_state))
 
+    def test_native_checkpoint_exports_an_isaac_free_frozen_actor(self):
+        actor = HaicStudentActor()
+        native_state = {
+            source_key: actor.state_dict()[target_key]
+            for target_key, source_key in _ACTOR_ADAPT_KEYS.items()
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "native.pt"
+            torch.save({"policy": {"actor_adapt": native_state}}, checkpoint)
+            exported = load_actor_adapt(checkpoint)
+
+        self.assertFalse(any(parameter.requires_grad for parameter in exported.parameters()))
+        for name, parameter in actor.state_dict().items():
+            torch.testing.assert_close(parameter, exported.state_dict()[name])
+
+    def test_dagger_flush_preserves_action_distillation_window(self):
+        row = {
+            "rgb": np.zeros((2, 2, 3), dtype=np.uint8),
+            "state": np.zeros(605, dtype=np.float32),
+            "action": np.zeros(256, dtype=np.float32),
+            "actor_input": np.zeros((5, 605), dtype=np.float32),
+            "teacher_action": np.zeros((5, 23), dtype=np.float32),
+            "termination": np.asarray([False, False, False, False, True]),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            with patch.object(
+                haic_vla,
+                "_encode_video",
+                side_effect=lambda _frames, path: path.write_bytes(b"video"),
+            ):
+                haic_vla._flush_dagger(output, 0, [row])
+            with np.load(
+                output / "rollout_shards/train/episode_000000/episode.npz"
+            ) as payload:
+                self.assertEqual(payload["actor_input"].shape, (1, 5, 605))
+                self.assertEqual(payload["teacher_action"].shape, (1, 5, 23))
+                self.assertEqual(payload["termination"].shape, (1, 5))
+
     def test_dagger_eval_counts_only_first_done_per_env(self):
         env = _FakeEvalEnv([1, 2])
         prediction_slots = []
@@ -183,6 +223,33 @@ class HaicVlaContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "1/2 episodes"):
                     haic_vla._dagger_eval(args, env, SimpleNamespace(), SimpleNamespace())
                 self.assertFalse((args.output_dir / "dagger-eval.json").exists())
+
+    def test_oracle_eval_uses_the_fixed_actor_without_a_vla_pool(self):
+        env = _FakeEvalEnv([1, 2])
+        args = SimpleNamespace(
+            max_steps=3,
+            output_dir=Path(),
+            mode="oracle-eval",
+            vla_cadence=1,
+        )
+        with patch.object(
+            runtime, "canonical_state", return_value=torch.zeros(2, 2)
+        ), patch.object(
+            runtime,
+            "teacher_latent",
+            return_value=torch.zeros(2, 256),
+        ), patch.object(
+            runtime, "student_actor_from_policy", return_value=_FakeActor()
+        ):
+            with tempfile.TemporaryDirectory() as output_dir:
+                args.output_dir = Path(output_dir)
+                result = haic_vla._oracle_eval(
+                    args, env, SimpleNamespace(), SimpleNamespace()
+                )
+                self.assertEqual(result["episodes"], 2)
+                self.assertEqual(result["successes"], 2)
+                self.assertEqual(result["success_rate"], 1.0)
+                self.assertTrue((args.output_dir / "oracle-eval.json").exists())
 
 if __name__ == "__main__":
     unittest.main()

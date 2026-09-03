@@ -6,6 +6,8 @@ runtime imports so the VLA runtime can execute a fixed copy of the controller.
 
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
 from typing import Mapping
 
 import torch
@@ -147,3 +149,33 @@ def extract_actor_adapt_state_dict(
         target_key: policy_state[source_key]
         for target_key, source_key in _ACTOR_ADAPT_KEYS.items()
     }
+
+
+def load_actor_adapt(
+    checkpoint_path: str | Path,
+    *,
+    device: torch.device | str = "cpu",
+) -> HaicStudentActor:
+    """Load a native HAIC checkpoint into the Isaac-free actor wrapper."""
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    actor = HaicStudentActor().to(device)
+    actor.load_state_dict(
+        extract_actor_adapt_state_dict(checkpoint["policy"]["actor_adapt"])
+    )
+    actor.requires_grad_(False).eval()
+    return actor
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Export the HAIC actor_adapt state")
+    parser.add_argument("checkpoint", type=Path)
+    parser.add_argument("output", type=Path)
+    args = parser.parse_args()
+    actor = load_actor_adapt(args.checkpoint)
+    temporary = args.output.with_suffix(".pt.tmp")
+    torch.save(actor.state_dict(), temporary)
+    temporary.replace(args.output)
+
+
+if __name__ == "__main__":
+    main()
