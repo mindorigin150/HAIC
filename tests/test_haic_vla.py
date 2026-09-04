@@ -239,6 +239,75 @@ class HaicVlaContractTest(unittest.TestCase):
         for name, parameter in actor.state_dict().items():
             torch.testing.assert_close(parameter, exported.state_dict()[name])
 
+    def test_profile_env_maps_vla_latent_through_fixed_actor(self):
+        seen = []
+
+        class Env:
+            device = torch.device("cpu")
+
+            def __init__(self, success):
+                self.success = success
+
+            def step_and_maybe_reset(self, action):
+                seen.append(action["action"])
+                return (
+                    _FakeTensorDict(
+                        {
+                            "next": _FakeTensorDict(
+                                {
+                                    "done": torch.tensor([[True]]),
+                                    "truncated": torch.tensor([[False]]),
+                                    "reward": torch.tensor([[2.0]]),
+                                    "stats": {
+                                        "success": torch.tensor([[self.success]])
+                                    },
+                                }
+                            )
+                        }
+                    ),
+                    self.carry,
+                )
+
+        class Actor:
+            def __call__(self, actor_input):
+                seen.append(actor_input)
+                return torch.zeros(1, 23)
+
+        env = Env(True)
+        env.carry = _FakeTensorDict(
+            {
+                "command": torch.zeros(1, 0),
+                "policy": torch.zeros(1, 605),
+            }
+        )
+        adapter = haic_vla._HaicProfileEnv(env, Actor())
+        adapter._carry = env.carry
+        self.assertEqual(seen, [])
+        result = adapter.step(
+            haic_vla.Action(value=np.ones(256, dtype=np.float32))
+        )
+
+        self.assertTrue(result.done)
+        self.assertEqual(result.reward, 2.0)
+        self.assertEqual(result.info, {"task_metrics": {"success": 1}})
+        self.assertEqual(seen[0].shape, (1, 861))
+        np.testing.assert_array_equal(seen[0][0, 605:].numpy(), np.ones(256))
+        self.assertEqual(seen[1].shape, (1, 23))
+
+        env = Env(False)
+        env.carry = _FakeTensorDict(
+            {
+                "command": torch.zeros(1, 0),
+                "policy": torch.zeros(1, 605),
+            }
+        )
+        adapter = haic_vla._HaicProfileEnv(env, Actor())
+        adapter._carry = env.carry
+        result = adapter.step(
+            haic_vla.Action(value=np.ones(256, dtype=np.float32))
+        )
+        self.assertEqual(result.info, {"task_metrics": {"success": 0}})
+
     def test_dagger_flush_preserves_per_step_action_distillation(self):
         row = {
             "rgb": np.zeros((2, 2, 3), dtype=np.uint8),

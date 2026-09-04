@@ -13,6 +13,18 @@ from typing import Any
 import numpy as np
 import torch
 
+HAIC_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[3]
+for source_root in (HAIC_ROOT, REPO_ROOT):
+    source = str(source_root)
+    if source in sys.path:
+        sys.path.remove(source)
+sys.path[:0] = [str(HAIC_ROOT), str(REPO_ROOT)]
+
+from latency_bench.core.types import Action, Observation, StepResult
+from latency_bench.envs.base import EnvAdapter
+from latency_bench.envs.raw_rgb import ENV_RAW_RGB_FRAME_STACK_INFO_KEY
+
 
 HAIC_TASK = "G1/haic/pull_cart"
 
@@ -28,11 +40,12 @@ def _parse_args() -> argparse.Namespace:
             "dagger-collect",
             "dagger-eval",
             "oracle-eval",
+            "profile",
         ),
     )
     parser.add_argument("--task", default=HAIC_TASK)
-    parser.add_argument("--teacher-checkpoint", required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--teacher-checkpoint", type=Path)
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=0)
@@ -45,8 +58,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--vla-cadence", type=int, default=5)
     parser.add_argument("--row-budget", type=int, default=32_000)
     parser.add_argument("--config-dir", type=Path)
+    parser.add_argument("--profile-config", type=Path)
     AppLauncher.add_app_launcher_args(parser)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.mode == "profile":
+        if args.profile_config is None:
+            parser.error("profile mode requires --profile-config")
+    elif args.teacher_checkpoint is None or args.output_dir is None:
+        parser.error("non-profile modes require --teacher-checkpoint and --output-dir")
+    return args
 
 
 def _compose_cfg(args: argparse.Namespace):
@@ -131,6 +151,97 @@ def _new_pool(args: argparse.Namespace):
         config=config,
         inference_devices=[args.inference_device],
     )
+
+
+class _HaicProfileEnv(EnvAdapter):
+    """Adapt the live single-instance HAIC environment to the realtime executor."""
+
+    env_fps = 50.0
+    OBSERVATION_TYPE = "haic_pull_cart"
+
+    def __init__(self, env, actor):
+        self._env = env
+        self._actor = actor
+        self.noop_action = Action(
+            value=np.zeros(256, dtype=np.float32),
+            name="noop",
+            is_noop=True,
+        )
+        self.env_step = 0
+        self._carry = None
+
+    def reset(self, seed: int | None = None) -> Observation:
+        if seed is not None:
+            self._env.set_seed(seed)
+        self._carry = self._env.reset()
+        self.env_step = 0
+        return self.observe()
+
+    def observe(self) -> Observation:
+        from active_adaptation.vla.runtime import canonical_state, refresh_rgb
+
+        state = canonical_state(self._carry)[0].detach().cpu().numpy()
+        rgb = refresh_rgb(self._env, update_hz=10)[0]
+        return Observation(
+            data=None,
+            env_step=self.env_step,
+            sim_time_ms=self.env_step * 20.0,
+            metadata={
+                ENV_RAW_RGB_FRAME_STACK_INFO_KEY: rgb[None],
+                "haic_state": state,
+                "slot_id": 0,
+            },
+        )
+
+    def step(self, action: Action) -> StepResult:
+        from active_adaptation.vla.runtime import canonical_state
+
+        latent = torch.as_tensor(
+            action.value,
+            device=self._env.device,
+            dtype=canonical_state(self._carry).dtype,
+        ).reshape(1, 256)
+        actor_input = torch.cat((canonical_state(self._carry), latent), dim=-1)
+        action_td = self._carry.clone(False)
+        action_td["action"] = self._actor(actor_input)
+        td, self._carry = self._env.step_and_maybe_reset(action_td)
+        self.env_step += 1
+        done = bool(td["next", "done"][0].item())
+        truncated = bool(td["next", "truncated"][0].item())
+        reward = float(td["next", "reward"][0].item())
+        success = int(td["next", "stats", "success"][0].item())
+        return StepResult(
+            observation=None,
+            reward=reward,
+            done=done,
+            truncated=truncated,
+            info={"task_metrics": {"success": success}},
+        )
+
+    def render_game_frame(self):
+        from active_adaptation.vla.runtime import rgb_frames
+
+        return rgb_frames(self._env)[0]
+
+    def close(self) -> None:
+        self._env.close()
+
+
+def _run_profile(profile_config: dict[str, Any], env, policy) -> dict[str, str]:
+    from active_adaptation.vla.runtime import student_actor_from_policy
+    from latency_bench.eval.driver import run_from_config
+
+    actor = student_actor_from_policy(policy, env.device)
+    profile_env = _HaicProfileEnv(
+        env,
+        actor,
+    )
+    run_from_config(
+        profile_config,
+        env=profile_env,
+        inference_devices=profile_config["executor"]["inference_devices"],
+    )
+    return {"output_dir": profile_config["logging"]["output_dir"]}
 
 
 @torch.inference_mode()
@@ -549,10 +660,21 @@ def _oracle_eval(args, env, policy, simulation_app) -> dict[str, Any]:
 
 
 def main() -> None:
+    from latency_bench.core.config import load_config
     from isaaclab.app import AppLauncher
     from omegaconf import OmegaConf
 
     args = _parse_args()
+    profile_config = None
+    if args.mode == "profile":
+        profile_config = load_config(args.profile_config)
+        args.teacher_checkpoint = Path(profile_config["env"]["runtime_checkpoint_path"])
+        args.output_dir = Path(profile_config["logging"]["output_dir"])
+        args.num_envs = 1
+        args.max_steps = profile_config["evaluation"]["eval_max_steps"]
+        args.seed = profile_config["experiment"]["seed"]
+        args.device = profile_config["env"]["simulator_device"]
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     cfg = _compose_cfg(args)
     app_launcher = AppLauncher(OmegaConf.to_container(cfg.app), device=args.device)
@@ -569,6 +691,8 @@ def main() -> None:
             result = _bootstrap_collect(args, env, policy, simulation_app)
         elif args.mode == "dagger-collect":
             result = _dagger_collect(args, env, policy, simulation_app)
+        elif args.mode == "profile":
+            result = _run_profile(profile_config, env, policy)
         elif args.mode == "dagger-eval":
             result = _dagger_eval(args, env, policy, simulation_app)
         else:
