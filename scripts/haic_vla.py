@@ -409,11 +409,21 @@ def _dagger_eval(args, env, policy, simulation_app) -> dict[str, Any]:
     actor = student_actor_from_policy(policy, env.device)
     env.base_env.eval()
     carry = env.reset()
+    command = env.base_env.command_manager
+    motion_len = command.motion_len.clone()
+    cart_start = command.object.data.root_link_pos_w.clone()
+    ref_cart_positions = command.dataset.data.body_pos_w[
+        torch.stack((command.motion_starts, command.motion_ends - 1)),
+        command.object_body_id_motion,
+    ]
+    ref_cart_displacement = ref_cart_positions[1] - ref_cart_positions[0]
     phase = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
     action_chunk = torch.zeros(
         env.num_envs, HAIC_ACTION_HORIZON, HAIC_LATENT_DIM, device=env.device
     )
     completed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    motion_progress = torch.zeros(env.num_envs, device=env.device)
+    cart_progress = torch.zeros(env.num_envs, device=env.device)
     done_count = 0
     success_count = 0
     try:
@@ -439,10 +449,24 @@ def _dagger_eval(args, env, policy, simulation_app) -> dict[str, Any]:
             action_td["action"] = actor(
                 torch.cat((canonical_state(carry), action_latent), dim=-1)
             )
+            motion_phase_before_step = command.t.clone()
+            cart_position_before_step = command.object.data.root_link_pos_w.clone()
             td, carry = env.step_and_maybe_reset(action_td)
             done = td["next", "done"].squeeze(-1)
             success = td["next", "stats", "success"].squeeze(-1).bool()
             first_done = done & ~completed
+            motion_progress[first_done] = (
+                motion_phase_before_step[first_done].float()
+                / (motion_len[first_done] - 1)
+            )
+            actual_cart_displacement = (
+                cart_position_before_step[first_done] - cart_start[first_done]
+            )
+            target_cart_displacement = ref_cart_displacement[first_done]
+            cart_progress[first_done] = (
+                (actual_cart_displacement * target_cart_displacement).sum(dim=-1)
+                / target_cart_displacement.square().sum(dim=-1)
+            ).clamp(0.0, 1.0)
             done_count += int(first_done.sum().item())
             success_count += int((first_done & success).sum().item())
             completed |= done
@@ -456,11 +480,22 @@ def _dagger_eval(args, env, policy, simulation_app) -> dict[str, Any]:
         raise RuntimeError(
             f"dagger evaluator stopped at {done_count}/{env.num_envs} episodes"
         )
+    pullcart_score = 50.0 * (motion_progress + cart_progress)
+
+    def summary(values: torch.Tensor) -> dict[str, float]:
+        return {
+            "mean": float(values.mean().item()),
+            "std": float(values.std(correction=0).item()),
+        }
+
     result = {
         "mode": args.mode,
         "episodes": done_count,
         "successes": success_count,
         "success_rate": success_count / done_count,
+        "motion_progress": summary(motion_progress),
+        "cart_progress": summary(cart_progress),
+        "pullcart_score": summary(pullcart_score),
     }
     (args.output_dir / "dagger-eval.json").write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n",

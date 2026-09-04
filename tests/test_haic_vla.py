@@ -48,7 +48,27 @@ class _FakeEvalEnv:
         self.num_envs = len(done_steps)
         self.step_count = 0
         self.events = []
-        self.base_env = SimpleNamespace(eval=lambda: self.events.append("eval"))
+        reference_positions = torch.zeros(3, 1, 3)
+        reference_positions[:, 0, 0] = torch.tensor([0.0, 0.5, 1.0])
+        command_manager = SimpleNamespace(
+            t=torch.zeros(self.num_envs, dtype=torch.long),
+            motion_len=torch.full((self.num_envs,), 3, dtype=torch.long),
+            motion_starts=torch.zeros(self.num_envs, dtype=torch.long),
+            motion_ends=torch.full((self.num_envs,), 3, dtype=torch.long),
+            object_body_id_motion=0,
+            dataset=SimpleNamespace(
+                data=SimpleNamespace(body_pos_w=reference_positions)
+            ),
+            object=SimpleNamespace(
+                data=SimpleNamespace(
+                    root_link_pos_w=torch.zeros(self.num_envs, 3)
+                )
+            ),
+        )
+        self.base_env = SimpleNamespace(
+            eval=lambda: self.events.append("eval"),
+            command_manager=command_manager,
+        )
 
     def reset(self):
         self.events.append("reset")
@@ -56,6 +76,10 @@ class _FakeEvalEnv:
 
     def step_and_maybe_reset(self, _action):
         self.step_count += 1
+        self.base_env.command_manager.t.fill_(self.step_count)
+        self.base_env.command_manager.object.data.root_link_pos_w[:, 0].fill_(
+            self.step_count / 2
+        )
         done = torch.tensor(
             [self.step_count >= done_step for done_step in self.done_steps]
         ).unsqueeze(-1)
@@ -333,6 +357,15 @@ class HaicVlaContractTest(unittest.TestCase):
                 self.assertEqual(result["episodes"], 2)
                 self.assertEqual(result["successes"], 2)
                 self.assertEqual(result["success_rate"], 1.0)
+                self.assertEqual(
+                    result["motion_progress"], {"mean": 0.25, "std": 0.25}
+                )
+                self.assertEqual(
+                    result["cart_progress"], {"mean": 0.25, "std": 0.25}
+                )
+                self.assertEqual(
+                    result["pullcart_score"], {"mean": 25.0, "std": 25.0}
+                )
                 self.assertNotIn("steps", result)
                 self.assertEqual(prediction_slots, [(0, 1), (1,)])
                 self.assertEqual(env.events[:2], ["eval", "reset"])
@@ -368,9 +401,54 @@ class HaicVlaContractTest(unittest.TestCase):
         ):
             with tempfile.TemporaryDirectory() as output_dir:
                 args.output_dir = Path(output_dir)
-                haic_vla._dagger_eval(args, env, SimpleNamespace(), SimpleNamespace())
+                result = haic_vla._dagger_eval(
+                    args, env, SimpleNamespace(), SimpleNamespace()
+                )
 
         self.assertEqual([int(item[0, 0].item()) for item in consumed], [0, 1, 2])
+        self.assertEqual(result["motion_progress"]["mean"], 1.0)
+        self.assertEqual(result["cart_progress"]["mean"], 1.0)
+        self.assertEqual(result["pullcart_score"]["mean"], 100.0)
+
+    def test_dagger_eval_clamps_cart_progress(self):
+        class OutOfRangeCartEnv(_FakeEvalEnv):
+            def step_and_maybe_reset(self, action):
+                result = super().step_and_maybe_reset(action)
+                if self.step_count == 1:
+                    self.base_env.command_manager.object.data.root_link_pos_w[:, 0] = (
+                        torch.tensor([-0.5, 1.5])
+                    )
+                return result
+
+        env = OutOfRangeCartEnv([2, 2])
+        args = SimpleNamespace(
+            max_steps=2,
+            output_dir=Path(),
+            mode="dagger-eval",
+            vla_cadence=1,
+            inference_batch_size=2,
+        )
+        with patch.object(haic_vla, "_new_pool", return_value=_FakePool()), patch.object(
+            runtime, "canonical_state", return_value=torch.zeros(2, 2)
+        ), patch.object(
+            runtime,
+            "refresh_rgb",
+            return_value=np.zeros((2, 1, 1, 3), dtype=np.uint8),
+        ), patch.object(
+            runtime,
+            "predict_vla",
+            return_value=np.zeros((2, 40, 256), dtype=np.float32),
+        ), patch.object(
+            runtime, "student_actor_from_policy", return_value=_FakeActor()
+        ):
+            with tempfile.TemporaryDirectory() as output_dir:
+                args.output_dir = Path(output_dir)
+                result = haic_vla._dagger_eval(
+                    args, env, SimpleNamespace(), SimpleNamespace()
+                )
+
+        self.assertEqual(result["cart_progress"], {"mean": 0.5, "std": 0.5})
+        self.assertEqual(result["pullcart_score"], {"mean": 50.0, "std": 25.0})
 
     def test_dagger_eval_does_not_write_partial_result(self):
         env = _FakeEvalEnv([1, 3])
