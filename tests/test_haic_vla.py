@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +13,8 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from active_adaptation.vla import backend as _backend
 
 from scripts import haic_vla
 from active_adaptation.learning.ppo.haic_actor import (
@@ -106,7 +110,36 @@ class _EncodedTensorDict(dict):
         return _EncodedTensorDict(self)
 
 
+def _native_env_method(name):
+    # These tensor-only methods can be checked without starting the Isaac SDK.
+    path = Path(__file__).resolve().parents[1] / "active_adaptation/envs/base.py"
+    tree = ast.parse(path.read_text())
+    env_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "_Env")
+    method = next(node for node in env_class.body if isinstance(node, ast.FunctionDef) and node.name == name)
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace[name]
+
+
 class HaicVlaContractTest(unittest.TestCase):
+    def setUp(self):
+        # Backend fixtures use dicts, not transformed TensorDicts.
+        step_mdp = patch.object(_backend, "step_mdp", lambda td: td["next"])
+        step_mdp.start()
+        self.addCleanup(step_mdp.stop)
+
+    def test_seeded_uniform_preserves_feature_and_per_environment_bounds(self):
+        draw = _native_env_method("random_uniform")
+        low = torch.tensor([10.0, 20.0])
+        env = SimpleNamespace(device="cpu", _episode_generators=[
+            torch.Generator().manual_seed(1), torch.Generator().manual_seed(2),
+        ])
+        samples = draw(env, low, low + 1.0, (2, 2), env_ids=torch.arange(2))
+        self.assertTrue(torch.all((samples >= low) & (samples <= low + 1.0)))
+        per_env_low = torch.tensor([[30.0, 40.0], [50.0, 60.0]])
+        samples = draw(env, per_env_low, per_env_low + 1.0, (2, 2), env_ids=torch.arange(2))
+        self.assertTrue(torch.all((samples >= per_env_low) & (samples <= per_env_low + 1.0)))
+
     def test_rgb_frames_compacts_noncontiguous_slots(self):
         output = torch.arange(8 * 1 * 1 * 4, dtype=torch.uint8).reshape(8, 1, 1, 4)
         env = SimpleNamespace(
@@ -244,8 +277,6 @@ class HaicVlaContractTest(unittest.TestCase):
             torch.testing.assert_close(parameter, exported.state_dict()[name])
 
     def test_vector_backend_maps_latent_through_fixed_actor(self):
-        import types
-
         from active_adaptation.vla.backend import HaicEnvStepBackend
         from latency_bench.core.types import Action
 
@@ -272,14 +303,19 @@ class HaicVlaContractTest(unittest.TestCase):
                 data=types.SimpleNamespace(root_link_pos_w=torch.zeros(1, 3))
             ),
         )
+        active_ids = torch.arange(1)
+        base_env_obj = types.SimpleNamespace(
+            device=torch.device("cpu"),
+            step_dt=0.02,
+            action_dim=23,
+            command_manager=command,
+            active_env_ids=active_ids,
+            set_active_env_ids=lambda slot_ids: None,
+        )
 
         class Env:
             num_envs = 1
-            base_env = types.SimpleNamespace(
-                device=torch.device("cpu"),
-                step_dt=0.02,
-                command_manager=command,
-            )
+            base_env = base_env_obj
 
             def step(self, action):
                 seen.append(action["action"])
@@ -320,6 +356,129 @@ class HaicVlaContractTest(unittest.TestCase):
         self.assertEqual(result[0].result.info["task_metrics"]["success"], 1)
         np.testing.assert_array_equal(actor_inputs[0][0, 605:].numpy(), np.ones(256))
         self.assertEqual(seen[0].shape, (1, 23))
+
+    def test_vector_backend_advances_only_tail_active_slots(self):
+        from active_adaptation.vla.backend import HaicEnvStepBackend
+        from latency_bench.core.types import Action
+
+        active_ids = torch.arange(2)
+        command = SimpleNamespace(
+            t=torch.tensor([5, 1]),
+            motion_len=torch.tensor([6, 4]),
+            object=SimpleNamespace(
+                data=SimpleNamespace(root_link_pos_w=torch.zeros(2, 3))
+            ),
+        )
+        base_env_obj = SimpleNamespace(
+            device=torch.device("cpu"),
+            step_dt=0.02,
+            action_dim=23,
+            command_manager=command,
+        )
+
+        def set_active_env_ids(slot_ids):
+            nonlocal active_ids
+            active_ids = torch.as_tensor(slot_ids)
+
+        base_env_obj.active_env_ids = active_ids
+        base_env_obj.set_active_env_ids = set_active_env_ids
+        actor_inputs = []
+        motor_actions = []
+
+        class Env:
+            num_envs = 2
+            base_env = base_env_obj
+
+            def step(self, action):
+                motor_actions.append(action["action"].clone())
+                command.t[active_ids] += 1
+                return _FakeTensorDict(
+                    {
+                        "next": _FakeTensorDict(
+                            {
+                                "done": torch.tensor([[False], [False]]),
+                                "truncated": torch.tensor([[False], [False]]),
+                                "reward": torch.zeros(2, 1),
+                                "stats": {"success": torch.zeros(2, 1)},
+                            }
+                        )
+                    }
+                )
+
+            def close(self):
+                pass
+
+        backend = HaicEnvStepBackend(
+            Env(),
+            lambda actor_input: (
+                actor_inputs.append(actor_input.clone())
+                or torch.full((len(actor_input), 23), 7.0)
+            ),
+        )
+        backend._carry = _FakeTensorDict(
+            {"command": torch.zeros(2, 0), "policy": torch.zeros(2, 605)}
+        )
+        backend._motion_len = [torch.tensor(6), torch.tensor(4)]
+        backend._cart_start = [torch.zeros(3), torch.zeros(3)]
+        backend._ref_cart_displacement = [torch.ones(3), torch.ones(3)]
+
+        responses = backend.step_slots({1: Action(value=np.ones(256, dtype=np.float32))})
+
+        self.assertEqual(list(responses), [1])
+        self.assertEqual(actor_inputs[0].shape, (1, 861))
+        torch.testing.assert_close(motor_actions[0][0], torch.zeros(23))
+        torch.testing.assert_close(motor_actions[0][1], torch.full((23,), 7.0))
+        torch.testing.assert_close(command.t, torch.tensor([5, 2]))
+
+    def test_reset_slot_does_not_consume_another_slots_rng(self):
+        from active_adaptation.vla.backend import HaicEnvStepBackend
+
+        active_ids = torch.arange(2)
+        generators = [torch.Generator().manual_seed(10), torch.Generator().manual_seed(20)]
+        command = SimpleNamespace(
+            motion_len=torch.ones(2, dtype=torch.long),
+            motion_starts=torch.zeros(2, dtype=torch.long),
+            motion_ends=torch.ones(2, dtype=torch.long),
+            object_body_id_motion=0,
+            dataset=SimpleNamespace(data=SimpleNamespace(body_pos_w=torch.zeros(1, 1, 3))),
+            object=SimpleNamespace(data=SimpleNamespace(root_link_pos_w=torch.zeros(2, 3))),
+        )
+        base_env_obj = SimpleNamespace(
+            device=torch.device("cpu"),
+            step_dt=0.02,
+            action_dim=23,
+            command_manager=command,
+        )
+
+        def set_active_env_ids(slot_ids):
+            nonlocal active_ids
+            active_ids = torch.as_tensor(slot_ids)
+
+        def set_episode_seed(slot_id, seed):
+            generators[slot_id] = torch.Generator().manual_seed(seed)
+
+        base_env_obj.active_env_ids = active_ids
+        base_env_obj.set_active_env_ids = set_active_env_ids
+        base_env_obj.set_episode_seed = set_episode_seed
+
+        class Env:
+            num_envs = 2
+            base_env = base_env_obj
+
+            def reset(self, _reset_td):
+                torch.rand(1, generator=generators[active_ids.item()])
+                return _FakeTensorDict({"command": torch.zeros(2, 0), "policy": torch.zeros(2, 605)})
+
+            def close(self):
+                pass
+
+        backend = HaicEnvStepBackend(Env(), lambda actor_input: torch.zeros(len(actor_input), 23))
+        backend._carry = _FakeTensorDict({"command": torch.zeros(2, 0), "policy": torch.zeros(2, 605)})
+        before = generators[1].get_state()
+
+        backend._reset_slot_state(0, seed=123)
+
+        self.assertTrue(torch.equal(generators[1].get_state(), before))
 
     def test_latency_eval_leaves_policy_in_common_executor(self):
         config = {
@@ -459,6 +618,89 @@ class HaicVlaContractTest(unittest.TestCase):
                 self.assertEqual(result["successes"], 2)
                 self.assertEqual(result["success_rate"], 1.0)
                 self.assertTrue((args.output_dir / "oracle-eval.json").exists())
+
+    def test_gae_applies_the_per_transition_discount(self):
+        from active_adaptation.learning.ppo.common import GAE
+
+        gae = GAE(gamma=0.9, lmbda=1.0)
+        reward = torch.tensor([[[1.0], [2.0]]])
+        terminated = torch.zeros_like(reward, dtype=torch.bool)
+        done = torch.zeros_like(reward, dtype=torch.bool)
+        value = torch.zeros_like(reward)
+        next_value = torch.tensor([[[3.0], [4.0]]])
+        discount = torch.tensor([[[0.5], [0.25]]])
+
+        advantage, returns = gae(
+            reward, terminated, done, value, next_value, discount
+        )
+
+        torch.testing.assert_close(
+            advantage, torch.tensor([[[3.655], [2.9]]])
+        )
+        torch.testing.assert_close(returns, advantage)
+
+    def test_latency_decoder_receives_normalized_intermediate_carries(self):
+        from tensordict import TensorDict
+
+        class Latency:
+            last_submission = [{}]
+            last_application = [None]
+
+            def submit(self, _commands, env_ids):
+                return torch.ones(1, dtype=torch.bool)
+
+            def actions(self, env_ids):
+                return torch.zeros(1, 1)
+
+            def advance(self, env_ids):
+                pass
+
+            def reset(self, env_ids):
+                pass
+
+        env = SimpleNamespace(num_envs=1)
+        env.cfg = types.SimpleNamespace(
+            latency_command_horizon=1,
+            latent_dim=1,
+            latency_control_repeat=2,
+            latency_gamma=0.9,
+        )
+        env.active_env_ids = torch.tensor([0])
+        env.device = torch.device("cpu")
+        env.discount = torch.ones(1, 1)
+        env.command_latency = Latency()
+        env.latency_decoder_inputs = []
+        env.latency_decoder = lambda _command, carry: (
+            env.latency_decoder_inputs.append(carry["policy"].clone())
+            or torch.zeros(1, 1)
+        )
+        env.set_active_env_ids = lambda ids: setattr(
+            env, "active_env_ids", torch.as_tensor(ids)
+        )
+        env._step_raw = lambda _td: TensorDict(
+            {
+                "command": torch.zeros(1, 1),
+                "policy": torch.tensor([[14.0]]),
+                "reward": torch.ones(1, 1),
+                "done": torch.zeros(1, 1, dtype=torch.bool),
+            },
+            batch_size=[1],
+        )
+        env.latency_observation_norm = lambda td: td.set(
+            "policy", (td["policy"] - 10.0) / 2.0
+        )
+
+        _native_env_method("_step_latency")(
+            env,
+            TensorDict(
+                {"action": torch.zeros(1, 1), "policy": torch.tensor([[1.0]])},
+                batch_size=[1],
+            )
+        )
+
+        torch.testing.assert_close(
+            torch.cat(env.latency_decoder_inputs), torch.tensor([[1.0], [2.0]])
+        )
 
 if __name__ == "__main__":
     unittest.main()

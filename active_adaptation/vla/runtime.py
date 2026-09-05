@@ -46,6 +46,13 @@ def teacher_action(policy, tensordict) -> torch.Tensor:
     return policy.actor.get_dist(encoded).mean
 
 
+@torch.inference_mode()
+def teacher_command(policy, tensordict) -> torch.Tensor:
+    """Return the native latency policy's issued latent command chunk."""
+    encoded = _teacher_encoded(policy, tensordict)
+    return policy.command_actor.get_dist(encoded).mean
+
+
 def student_actor_from_policy(policy, device: torch.device) -> HaicStudentActor:
     """Copy native ``policy.actor_adapt`` weights into the pure actor."""
     actor = HaicStudentActor().to(device)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import traceback
@@ -45,7 +46,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--split", choices=("train", "val"), default="train")
     parser.add_argument("--episode-budget", type=int, default=250)
+    parser.add_argument("--keep-failed", action="store_true")
     parser.add_argument("--policy-config", type=Path)
+    parser.add_argument("--latency-config", type=Path)
     parser.add_argument("--inference-device", default="cuda:0")
     parser.add_argument("--inference-batch-size", type=int, default=32)
     parser.add_argument("--dagger-round", type=int, default=0)
@@ -60,6 +63,8 @@ def _parse_args() -> argparse.Namespace:
             parser.error("latency-eval mode requires --eval-config")
     elif args.teacher_checkpoint is None or args.output_dir is None:
         parser.error("non-latency-eval modes require --teacher-checkpoint and --output-dir")
+    elif args.mode == "bootstrap-collect" and args.latency_config is None:
+        parser.error("bootstrap-collect mode requires --latency-config")
     return args
 
 
@@ -69,8 +74,13 @@ def _compose_cfg(args: argparse.Namespace):
     from omegaconf import OmegaConf
 
     config_dir = args.config_dir or Path(__file__).resolve().parents[1] / "cfg"
+    algo = (
+        "ppo_haic_latency_command"
+        if args.mode == "bootstrap-collect"
+        else "ppo_haic_train"
+    )
     overrides = [
-        "algo=ppo_haic_train",
+        f"algo={algo}",
         f"task={args.task}",
         f"task.num_envs={args.num_envs}",
         "task.enable_cameras=false",
@@ -84,6 +94,14 @@ def _compose_cfg(args: argparse.Namespace):
         "vecnorm=eval",
         "eval_render=false",
     ]
+    if args.mode == "bootstrap-collect":
+        overrides.extend(
+            [
+                "task.latency_command=true",
+                f"task.latency_config_path={args.latency_config}",
+                "task.latency_control_repeat=1",
+            ]
+        )
     with hydra.initialize_config_dir(version_base=None, config_dir=str(config_dir.resolve())):
         cfg = hydra.compose(config_name="train", overrides=overrides)
     OmegaConf.resolve(cfg)
@@ -167,78 +185,198 @@ def _run_latency_eval(eval_config: dict[str, Any], env, policy) -> dict[str, str
 
 @torch.inference_mode()
 def _bootstrap_collect(args, env, policy, simulation_app) -> dict[str, Any]:
+    """Collect admitted native command chunks with raw-frame decoder labels."""
     from active_adaptation.vla.runtime import (
+        HAIC_ACTION_HORIZON,
         HAIC_CONTROL_HZ,
+        HAIC_LATENT_DIM,
         canonical_state,
-        teacher_latent,
+        teacher_command,
         refresh_rgb,
-        teacher_action,
+        student_actor_from_policy,
     )
     from latency_bench.data.haic_dagger import write_haic_bootstrap_shard
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    transport = env.base_env.command_latency
+    decoder = student_actor_from_policy(policy, env.device)
     target_episodes = args.episode_budget
     accepted = 0
+    completed = 0
     episode_index = 0
     carry = env.reset()
-    rows_by_slot: list[list[dict[str, Any]]] = [[] for _ in range(env.num_envs)]
+    num_envs = env.num_envs
+    command_chunks = torch.zeros(
+        num_envs, HAIC_ACTION_HORIZON, HAIC_LATENT_DIM, device=env.device
+    )
+    rows_by_slot: list[list[dict[str, Any]]] = [[] for _ in range(num_envs)]
+    actor_inputs: list[list[np.ndarray]] = [[] for _ in range(num_envs)]
+    terminations: list[list[bool]] = [[] for _ in range(num_envs)]
+    control_traces: list[list[dict[str, Any]]] = [[] for _ in range(num_envs)]
+    raw_steps = 0
+
+    def write_episode(slot: int) -> None:
+        nonlocal accepted, episode_index
+        rows = rows_by_slot[slot]
+        if not rows or accepted >= target_episodes:
+            return
+        for row in rows:
+            start = row["issued_raw_frame"]
+            aligned = np.asarray(
+                actor_inputs[slot][start : start + HAIC_ACTION_HORIZON],
+                dtype=np.float32,
+            )
+            mask = np.asarray(
+                terminations[slot][start : start + HAIC_ACTION_HORIZON],
+                dtype=bool,
+            )
+            aligned = np.pad(
+                aligned,
+                ((0, HAIC_ACTION_HORIZON - len(aligned)), (0, 0)),
+                mode="edge",
+            )
+            mask = np.pad(
+                mask,
+                (0, HAIC_ACTION_HORIZON - len(mask)),
+                constant_values=True,
+            )
+            command = torch.as_tensor(
+                row["action"], device=env.device, dtype=torch.float32
+            )
+            decoder_input = torch.cat(
+                (torch.as_tensor(aligned, device=env.device), command), dim=-1
+            )
+            row["actor_input"] = aligned
+            row["teacher_action"] = decoder(decoder_input).cpu().numpy()
+            row["termination"] = mask
+        shard = output_dir / f".bootstrap_{episode_index:06d}.mp4"
+        _encode_video([row["rgb"] for row in rows], shard)
+        arrays = {
+            name: np.stack([row[name] for row in rows]).astype(np.float32)
+            for name in ("state", "action", "actor_input", "teacher_action")
+        }
+        arrays["termination"] = np.stack(
+            [row["termination"] for row in rows]
+        ).astype(bool)
+        arrays.update(
+            {
+                "control_applied_command": np.stack(
+                    [record["applied_command"] for record in control_traces[slot]
+                    ]
+                ).astype(np.float32),
+                "control_source_raw_frame": np.asarray(
+                    [record["source_raw_frame"] for record in control_traces[slot]],
+                    dtype=np.int64,
+                ),
+                "control_source_obs_id": np.asarray(
+                    [record["source_obs_id"] for record in control_traces[slot]],
+                    dtype=np.int64,
+                ),
+                "control_chunk_index": np.asarray(
+                    [record["chunk_index"] for record in control_traces[slot]],
+                    dtype=np.int64,
+                ),
+                "control_reward": np.asarray(
+                    [record["reward"] for record in control_traces[slot]],
+                    dtype=np.float32,
+                ),
+                "control_done": np.asarray(
+                    [record["done"] for record in control_traces[slot]],
+                    dtype=bool,
+                ),
+            }
+        )
+        arrays.update(
+            {
+                name: np.asarray([row[name] for row in rows])
+                for name in (
+                    "episode_id",
+                    "obs_id",
+                    "issued_raw_frame",
+                    "ready_raw_frame",
+                    "latency_ms",
+                    "worker_id",
+                )
+            }
+        )
+        arrays["image_shape"] = rows[0]["rgb"].shape
+        write_haic_bootstrap_shard(
+            output_dir,
+            split=args.split,
+            episode_idx=episode_index,
+            arrays=arrays,
+            video_path=shard,
+        )
+        shard.unlink()
+        accepted += 1
+        episode_index += 1
 
     while accepted < target_episodes and simulation_app.is_running():
+        due_slots = [
+            slot
+            for slot, frame in enumerate(transport.frames)
+            if frame % transport.clock.obs_stride_raw_frames == 0
+        ]
         state = canonical_state(carry)
-        teacher = teacher_action(policy, carry)
-        target = teacher_latent(policy, carry)
-        rgb = refresh_rgb(env, update_hz=HAIC_CONTROL_HZ)
         state_cpu = state.detach().cpu().numpy().astype(np.float32, copy=False)
-        teacher_cpu = teacher.detach().cpu().numpy().astype(np.float32, copy=False)
-        target_cpu = target.detach().cpu().numpy().astype(np.float32, copy=False)
-        for slot in range(env.num_envs):
-            rows_by_slot[slot].append(
-                {
-                    "rgb": rgb[slot].copy(),
-                    "state": state_cpu[slot].copy(),
-                    "action": target_cpu[slot].copy(),
-                    "actor_input": state_cpu[slot].copy(),
-                    "teacher_action": teacher_cpu[slot].copy(),
-                    "termination": False,
-                }
+        if due_slots:
+            command = teacher_command(policy, carry)
+            command_chunks[:] = command.reshape(
+                num_envs, HAIC_ACTION_HORIZON, HAIC_LATENT_DIM
             )
+            rgb = refresh_rgb(env, due_slots, update_hz=HAIC_CONTROL_HZ)
+            for index, slot in enumerate(due_slots):
+                rows_by_slot[slot].append(
+                    {
+                        "rgb": rgb[index].copy(),
+                        "state": state_cpu[slot].copy(),
+                        "action": command_chunks[slot].cpu().numpy().copy(),
+                    }
+                )
+        for slot in range(num_envs):
+            actor_inputs[slot].append(state_cpu[slot].copy())
 
         action_td = carry.clone(False)
-        action_td["action"] = teacher
+        action_td["action"] = command_chunks.reshape(num_envs, -1)
         td, carry = env.step_and_maybe_reset(action_td)
-        done = td["next", "done"].squeeze(-1)
+        raw_steps += num_envs
+        for trace in env.base_env.latency_last_trace:
+            for index, slot in enumerate(trace["env_ids"].detach().cpu().tolist()):
+                application = trace["application"][index]
+                control_traces[slot].append(
+                    {
+                        "applied_command": trace["applied_command"][slot]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .copy(),
+                        "source_raw_frame": application["source_raw_frame"],
+                        "source_obs_id": application["source_obs_id"],
+                        "chunk_index": application["chunk_index"],
+                        "reward": trace["reward"][slot].sum().item(),
+                        "done": bool(trace["done"][slot].item()),
+                    }
+                )
+        for slot in due_slots:
+            submission = env.base_env.latency_last_submission[slot]
+            row = rows_by_slot[slot][-1]
+            if submission is None:
+                rows_by_slot[slot].pop()
+            else:
+                row.update(submission)
+        done = td["next", "done"].squeeze(-1).bool()
         success = td["next", "stats", "success"].squeeze(-1).bool()
+        for slot in range(num_envs):
+            terminations[slot].append(bool(done[slot].item()))
         for slot in done.nonzero(as_tuple=False).flatten().cpu().tolist():
-            rows = rows_by_slot[slot]
-            rows[-1]["termination"] = True
-            if success[slot].item() and accepted < target_episodes:
-                shard = output_dir / f".bootstrap_{episode_index:06d}.mp4"
-                _encode_video([row["rgb"] for row in rows], shard)
-                arrays = {
-                    name: np.stack([item[name] for item in rows]).astype(np.float32)
-                    for name in (
-                        "state",
-                        "action",
-                        "actor_input",
-                        "teacher_action",
-                    )
-                }
-                arrays["termination"] = np.asarray(
-                    [item["termination"] for item in rows], dtype=bool
-                )
-                arrays["image_shape"] = rows[0]["rgb"].shape
-                write_haic_bootstrap_shard(
-                    output_dir,
-                    split=args.split,
-                    episode_idx=episode_index,
-                    arrays=arrays,
-                    video_path=shard,
-                )
-                shard.unlink()
-                accepted += 1
-                episode_index += 1
+            completed += 1
+            if (args.keep_failed or success[slot].item()) and accepted < target_episodes:
+                write_episode(slot)
             rows_by_slot[slot] = []
+            actor_inputs[slot] = []
+            terminations[slot] = []
+            control_traces[slot] = []
     if accepted != target_episodes:
         raise RuntimeError(
             f"bootstrap collector stopped at {accepted}/{target_episodes} episodes"
@@ -250,12 +388,19 @@ def _bootstrap_collect(args, env, policy, simulation_app) -> dict[str, Any]:
         "split": args.split,
         "episode_budget": args.episode_budget,
         "control_repeat": args.vla_cadence,
+        "completed_episodes": completed,
+        "raw_steps": raw_steps,
+        "keep_failed": args.keep_failed,
+        "issued_command_shape": [HAIC_ACTION_HORIZON, 256],
+        "actor_input_shape": [HAIC_ACTION_HORIZON, 605],
+        "teacher_action_shape": [HAIC_ACTION_HORIZON, 23],
+        "termination_shape": [HAIC_ACTION_HORIZON],
     }
     _write_metadata(
         output_dir,
         {
             **result,
-            "schema_version": 4,
+            "schema_version": 6,
             "shard_format": "npz+mp4",
             "shard_root": "rollout_shards",
             "rows_unit": "control_step",
@@ -263,10 +408,11 @@ def _bootstrap_collect(args, env, policy, simulation_app) -> dict[str, Any]:
             "vla_fps": 10,
             "state_dim": 605,
             "vla_action_dim": 256,
+            "issued_command_shape": [HAIC_ACTION_HORIZON, 256],
             "teacher_latent_dim": 256,
-            "actor_input_shape": [605],
-            "teacher_action_shape": [23],
-            "termination_shape": [],
+            "actor_input_shape": [HAIC_ACTION_HORIZON, 605],
+            "teacher_action_shape": [HAIC_ACTION_HORIZON, 23],
+            "termination_shape": [HAIC_ACTION_HORIZON],
             "prompt": "Pull the cart along the reference motion.",
         },
     )
@@ -291,7 +437,8 @@ def _flush_dagger(output_dir: Path, shard_index: int, rows: list[dict[str, Any]]
             "termination",
         )
     }
-    arrays["termination"][-1] = True
+    if np.asarray(arrays["termination"]).ndim == 1:
+        arrays["termination"][-1] = True
     arrays["image_shape"] = rows[0]["rgb"].shape
     write_haic_dagger_shard(
         output_dir,
@@ -333,6 +480,7 @@ def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
     row_count = 0
     control_step = 0
     shard_index = 0
+
     try:
         while row_count < args.row_budget and simulation_app.is_running():
             rgb = refresh_rgb(env, update_hz=HAIC_CONTROL_HZ)
@@ -518,15 +666,18 @@ def main() -> None:
             result = _run_latency_eval(eval_config, env, policy)
         else:
             result = _oracle_eval(args, env, policy, simulation_app)
-        print(json.dumps(result, indent=2, sort_keys=True))
+        print(json.dumps(result, indent=2, sort_keys=True), flush=True)
     except BaseException:
         traceback.print_exc()
         exit_code = 1
     finally:
         env.close()
+        if exit_code:
+            # Kit's immediate shutdown exits with status 0 before Python resumes.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(exit_code)
         simulation_app.close(skip_cleanup=True)
-    if exit_code:
-        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

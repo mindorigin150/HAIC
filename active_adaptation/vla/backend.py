@@ -15,6 +15,7 @@ from typing import Any
 import gymnasium as gym
 import numpy as np
 import torch
+from torchrl.envs.utils import step_mdp
 
 from latency_bench.core.types import Action, Observation, StepResult
 from latency_bench.executors.env_step_backend import (
@@ -112,6 +113,8 @@ class HaicEnvStepBackend:
 
     def step_slots(self, actions_by_slot: Mapping[int, Action]) -> dict[int, EnvStepResponse]:
         slot_ids = [int(slot_id) for slot_id in actions_by_slot]
+        previous_active_ids = self.base_env.active_env_ids
+        self.base_env.set_active_env_ids(slot_ids)
         action_values = torch.zeros(
             self.num_slots,
             HAIC_LATENT_DIM,
@@ -130,12 +133,22 @@ class HaicEnvStepBackend:
         motion_phase_before = command.t.clone()
         cart_position_before = command.object.data.root_link_pos_w.clone()
         action_td = self._carry.clone(False)
-        action_td["action"] = self.actor(torch.cat((state_before, action_values), dim=-1))
+        actor_input = torch.cat((state_before, action_values), dim=-1)
+        motor_actions = torch.zeros(
+            self.num_slots,
+            self.base_env.action_dim,
+            dtype=state_before.dtype,
+            device=state_before.device,
+        )
+        active_ids = torch.as_tensor(slot_ids, device=state_before.device)
+        motor_actions[active_ids] = self.actor(actor_input[active_ids])
+        action_td["action"] = motor_actions
 
         start = time.perf_counter()
-        td = self.env.step(action_td)
-        from torchrl.envs.utils import step_mdp
-
+        try:
+            td = self.env.step(action_td)
+        finally:
+            self.base_env.set_active_env_ids(previous_active_ids)
         self._carry = step_mdp(td)
         elapsed = time.perf_counter() - start
         next_td = td["next"]
@@ -199,12 +212,17 @@ class HaicEnvStepBackend:
         self.env.close()
 
     def _reset_slot_state(self, slot_id: int, seed: int | None) -> None:
-        self.base_env.set_episode_seed(slot_id, seed)
-        reset_mask = torch.zeros(self.num_slots, dtype=torch.bool, device=self.base_env.device)
-        reset_mask[slot_id] = True
-        reset_td = self._carry.clone(False)
-        reset_td["_reset"] = reset_mask
-        self._carry = self.env.reset(reset_td)
+        previous_active_ids = self.base_env.active_env_ids
+        self.base_env.set_active_env_ids([slot_id])
+        try:
+            self.base_env.set_episode_seed(slot_id, seed)
+            reset_mask = torch.zeros(self.num_slots, dtype=torch.bool, device=self.base_env.device)
+            reset_mask[slot_id] = True
+            reset_td = self._carry.clone(False)
+            reset_td["_reset"] = reset_mask
+            self._carry = self.env.reset(reset_td)
+        finally:
+            self.base_env.set_active_env_ids(previous_active_ids)
 
         command = self.base_env.command_manager
         self._motion_len[slot_id] = command.motion_len[slot_id].clone()
