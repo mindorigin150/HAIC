@@ -859,7 +859,8 @@ class PPOHAIC(TensorDictModuleBase):
 
         adv = tensordict["adv"]
         log_ratio = (log_probs - tensordict["sample_log_prob"]).unsqueeze(-1)
-        ratio = torch.exp(log_ratio)
+        # ponytail: bound H40 joint ratios for float32 gradients; revisit the loss if saturation is common.
+        ratio = torch.exp(log_ratio.clamp(-20.0, 20.0))
         surr1 = adv * ratio
         surr2 = adv * ratio.clamp(1.-self.clip_param, 1.+self.clip_param)
         if self.cfg.normalize_ratio:
