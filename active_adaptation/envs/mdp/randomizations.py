@@ -478,30 +478,41 @@ class push(Randomization):
 
     def step(self, substep):
         if substep == 0:
-            t = self.env.episode_length_buf.view(self.env.num_envs, 1, 1)
-            env_ids = torch.arange(self.env.num_envs, device=self.env.device)
+            env_ids = self.env.active_env_ids
+            t = self.env.episode_length_buf[env_ids].view(-1, 1, 1)
             i = self.env.random_uniform(
                 0.0,
                 1.0,
-                (self.env.num_envs, len(self.body_indices), 1),
+                (len(env_ids), len(self.body_indices), 1),
                 env_ids=env_ids,
             ) < 0.02
-            i = i & ((t - self.last_push) > self.min_interval)
-            self.last_push = torch.where(i, t, self.last_push)
+            i = i & ((t - self.last_push[env_ids]) > self.min_interval)
+            self.last_push[env_ids] = torch.where(i, t, self.last_push[env_ids])
 
-            push_forces = torch.zeros_like(self.forces)
+            push_forces = torch.zeros_like(self.forces[env_ids])
             push_forces[:, :, 0] = self.env.random_uniform(
                 *self.force_range,
-                (self.env.num_envs, len(self.body_indices)),
+                (len(env_ids), len(self.body_indices)),
                 env_ids=env_ids,
             )
             push_forces[:, :, 1] = self.env.random_uniform(
                 *self.force_range,
-                (self.env.num_envs, len(self.body_indices)),
+                (len(env_ids), len(self.body_indices)),
                 env_ids=env_ids,
             )
-            self.forces = torch.where(i, push_forces * self.default_mass_total, self.forces * self.decay)
-        self.asset.permanent_wrench_composer.set_forces_and_torques(self.forces, self.torques, body_ids=self.body_indices)
+            self.forces[env_ids] = torch.where(
+                i,
+                push_forces * self.default_mass_total,
+                self.forces[env_ids] * self.decay,
+            )
+        inactive = torch.ones(self.env.num_envs, dtype=torch.bool, device=self.env.device)
+        inactive[self.env.active_env_ids] = False
+        self.forces[inactive] = 0.0
+        self.asset.set_external_force_and_torque(
+            self.forces,
+            self.torques,
+            body_ids=self.body_indices,
+        )
 
     def debug_draw(self):
         self.env.debug_draw.vector(

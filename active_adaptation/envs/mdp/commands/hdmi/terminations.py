@@ -21,9 +21,11 @@ class _cum_error_mixin:
             self.__cum_steps = torch.zeros(self.num_envs, dtype=torch.int32)
         
     def update(self):
-        self.__exceeded = self.error >= self.threshold
-        self.__cum_steps[self.__exceeded] += 1
-        self.__cum_steps[~self.__exceeded] = 0
+        active = self.env.active_env_ids
+        self.__exceeded[active] = self.error[active] >= self.threshold
+        self.__cum_steps[active] = torch.where(
+            self.__exceeded[active], self.__cum_steps[active] + 1, 0
+        )
 
     def reset(self, env_ids):
         self.__cum_steps[env_ids] = 0

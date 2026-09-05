@@ -12,6 +12,7 @@ terrain: plane
 
 num_envs: 4096
 max_episode_length: 1000
+latency_command: false
 
 sim:
   step_dt: 0.02

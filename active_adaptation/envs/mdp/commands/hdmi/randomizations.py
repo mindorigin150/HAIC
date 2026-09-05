@@ -388,7 +388,11 @@ class push_start(RobotObjectTrackRandomization):
             push_forces[:, :, 0].uniform_(*self.force_range)
             push_forces[:, :, 1].uniform_(*self.force_range)
             self.forces = torch.where(i, push_forces * self.default_mass_total, self.forces * self.decay)
-        self.asset.permanent_wrench_composer.set_forces_and_torques(self.forces, self.torques, body_ids=self.body_indices)
+        self.asset.set_external_force_and_torque(
+            self.forces,
+            self.torques,
+            body_ids=self.body_indices,
+        )
 
     def debug_draw(self):
         self.env.debug_draw.vector(
@@ -480,4 +484,8 @@ class push_per_motion(RobotObjectTrackRandomization):
                     push_forces[env_mask, :, 1].uniform_(*force_range)
 
             self.forces = torch.where(i, push_forces * self.default_mass_total, self.forces * self.decay)
-        self.asset.permanent_wrench_composer.set_forces_and_torques(self.forces, self.torques, body_ids=self.all_body_indices)
+        self.asset.set_external_force_and_torque(
+            self.forces,
+            self.torques,
+            body_ids=self.all_body_indices,
+        )

@@ -23,6 +23,7 @@ import active_adaptation.learning.ppo.ppo_haic
 import active_adaptation.learning.ppo.critics
 from active_adaptation.utils.wandb import parse_checkpoint_path
 import active_adaptation
+from training.common.checkpoints import restore_rng_state
 if TYPE_CHECKING:
     from active_adaptation.envs.base import _Env
 
@@ -227,12 +228,32 @@ def make_env_policy(cfg: DictConfig):
 
     base_env = SimpleEnv(cfg.task)
 
+    if cfg.task.latency_command:
+        from latency_bench.core.config import load_config
+        from training.common.command_latency import CommandLatencyBatch
+
+        latency_config = load_config(cfg.task.latency_config_path)
+        base_env.command_latency = CommandLatencyBatch(
+            latency_config,
+            num_envs=base_env.num_envs,
+            device=base_env.device,
+            noop_command=torch.zeros(cfg.task.latent_dim, device=base_env.device),
+        )
+        base_env.command_latency.reset()
+
     checkpoint_path = parse_checkpoint_path(cfg.checkpoint_path) if active_adaptation.is_main_process() else None
     checkpoint_path = active_adaptation.broadcast_object(checkpoint_path)
     if checkpoint_path is not None:
         state_dict = torch.load(checkpoint_path, weights_only=False)
     else:
         state_dict = {}
+    resuming_latency_command = (
+        cfg.task.latency_command
+        and checkpoint_path is not None
+        and state_dict["policy"]["last_phase"] == "latency_command"
+    )
+    if base_env.command_latency is not None and resuming_latency_command:
+        base_env.command_latency.load_state_dict(state_dict["env"]["command_latency"])
     
     obs_keys = [
         key for key, spec in base_env.observation_spec.items(True, True) 
@@ -240,6 +261,8 @@ def make_env_policy(cfg: DictConfig):
     ]
     transform = Compose(InitTracker(), StepCounter())
 
+    if cfg.task.latency_command:
+        cfg.vecnorm = "eval"
     assert cfg.vecnorm in ("train", "eval", None)
     print(colored(f"[Info]: create VecNorm for keys: {obs_keys}", "green"))
     vecnorm_cls = DistributedVecNorm if cfg.vecnorm == "train" and active_adaptation.is_distributed() else VecNorm
@@ -249,6 +272,8 @@ def make_env_policy(cfg: DictConfig):
     if "vecnorm" in state_dict.keys():
         print(colored("[Info]: Load VecNorm from checkpoint.", "green"))
         vecnorm.load_state_dict(state_dict["vecnorm"])
+    if cfg.task.latency_command:
+        base_env.latency_observation_norm = vecnorm.to_observation_norm()
     if cfg.vecnorm == "train":
         print(colored("[Info]: Updating obervation normalizer.", "green"))
         transform.append(vecnorm)
@@ -275,7 +300,19 @@ def make_env_policy(cfg: DictConfig):
     
     if "policy" in state_dict.keys():
         print(colored("[Info]: Load policy from checkpoint.", "green"))
-        policy.load_state_dict(state_dict["policy"])
+        policy.load_state_dict(
+            state_dict["policy"],
+            strict=not cfg.task.latency_command or resuming_latency_command,
+        )
+
+    if cfg.task.latency_command:
+        from active_adaptation.vla.runtime import student_actor_from_policy
+
+        decoder = student_actor_from_policy(policy, base_env.device)
+        policy.actor_adapt.requires_grad_(False)
+        base_env.latency_decoder = lambda command, carry: decoder(
+            torch.cat((carry["command"], carry["policy"], command), dim=-1)
+        )
     
     if hasattr(policy, "make_tensordict_primer"):
         primer = policy.make_tensordict_primer()
@@ -283,6 +320,9 @@ def make_env_policy(cfg: DictConfig):
         transform.append(primer)
         env = TransformedEnv(env.base_env, transform)
     env: _Env
+
+    if resuming_latency_command:
+        restore_rng_state(state_dict["rng_state"])
 
     return env, policy, vecnorm
 

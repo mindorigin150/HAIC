@@ -8,6 +8,12 @@ import logging
 import os
 import time
 import datetime
+import pathlib
+import sys
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 import inspect
 import shutil
 
@@ -17,6 +23,7 @@ from tqdm import tqdm
 from setproctitle import setproctitle
 
 import active_adaptation as aa
+from training.common.checkpoints import capture_rng_state
 from isaaclab.app import AppLauncher
 # from active_adaptation.utils.torchrl import SyncDataCollector
 from torchrl.envs.utils import set_exploration_type, ExplorationType
@@ -59,7 +66,7 @@ def main(cfg: DictConfig):
         run.config.update(OmegaConf.to_container(cfg))
 
         default_run_name = f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
-        run_idx = run.name.split("-")[-1]
+        run_idx = run.id
         run.name = f"{run_idx}-{default_run_name}"
         setproctitle(run.name)
 
@@ -96,8 +103,12 @@ def main(cfg: DictConfig):
         state_dict = OrderedDict()
         state_dict["wandb"] = {"name": run.name, "id": run.id}
         state_dict["policy"] = policy.state_dict()
-        state_dict["env"] = env.state_dict()
+        env_state = env.state_dict()
+        if env.base_env.command_latency is not None:
+            env_state["command_latency"] = env.base_env.command_latency.state_dict()
+        state_dict["env"] = env_state
         state_dict["cfg"] = cfg
+        state_dict["rng_state"] = capture_rng_state()
         if "vecnorm" in locals():
             state_dict["vecnorm"] = vecnorm.state_dict()
         torch.save(state_dict, ckpt_path)
@@ -124,7 +135,8 @@ def main(cfg: DictConfig):
     with torch.inference_mode():
         tmp_carry = rollout_policy(carry.clone(False))
         tmp_td, _ = env.step_and_maybe_reset(tmp_carry.clone(False))
-        tmp_td["next"] = tmp_td["next"].select("done", "terminated", "discount", "reward", "stats", "is_init", "adapt_hx", strict=False)
+        tmp_td["next", "state_value"] = policy.critic(tmp_td["next"])["state_value"]
+        tmp_td["next"] = tmp_td["next"].select("done", "terminated", "discount", "reward", "stats", "is_init", "adapt_hx", "state_value", "command_admitted", strict=False)
 
     N = env.num_envs
     T = cfg.algo.train_every
@@ -152,15 +164,10 @@ def main(cfg: DictConfig):
             for step in range(cfg.algo.train_every):
                 carry = rollout_policy(carry)
                 td, carry = env.step_and_maybe_reset(carry)
-                td["next"] = td["next"].select("done", "terminated", "discount", "reward", "stats", "is_init", "adapt_hx", strict=False)
+                td["next", "state_value"] = policy.critic(td["next"])["state_value"]
+                td["next"] = td["next"].select("done", "terminated", "discount", "reward", "stats", "is_init", "adapt_hx", "state_value", "command_admitted", strict=False)
                 data_buf[:, step] = td
             policy.critic(data_buf)
-            values = data_buf["state_value"]
-            data_buf["next", "state_value"] = torch.where(
-                data_buf["next", "done"],
-                values, # a walkaround to avoid storing the next states
-                torch.cat([values[:, 1:], policy.critic(carry.copy())["state_value"].unsqueeze(1)], dim=1)
-            )
         rollout_time = time.perf_counter() - rollout_start
         rollout_time = torch.tensor(rollout_time, device=device)
         aa.all_reduce(rollout_time, op=torch.distributed.ReduceOp.MAX)

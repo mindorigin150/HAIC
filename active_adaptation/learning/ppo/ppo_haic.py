@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as D
-import warnings
 import functools
 import torch.utils._pytree as pytree
 import einops
@@ -68,6 +67,12 @@ def _global_mean(value):
         value.div_(aa.get_world_size())
     return value
 
+
+def _global_count(mask):
+    count = mask.sum().detach().clone()
+    aa.all_reduce(count)
+    return count
+
 @dataclass
 class PPOConfig:
     _target_: str = "active_adaptation.learning.ppo.ppo_haic.PPOHAIC"
@@ -113,12 +118,14 @@ class PPOConfig:
 
     clip_adv: float | None = None
     phase: str = "train"
+    command_horizon: int = 40
     vecnorm: Union[str, None] = None
     checkpoint_path: Union[str, None] = None
     in_keys: List[str] = (CMD_KEY, OBS_KEY, OBJECT_KEY, OBS_PRIV_KEY, OBJECT_GEO_KEY)
 
 cs = ConfigStore.instance()
 cs.store("ppo_haic_train", node=PPOConfig(phase="train", vecnorm="train", entropy_coef_start=0.001, entropy_coef_end=0.001), group="algo")
+cs.store("ppo_haic_latency_command", node=PPOConfig(phase="latency_command", vecnorm="train", entropy_coef_start=0.001, entropy_coef_end=0.001), group="algo")
 cs.store("ppo_haic_adapt", node=PPOConfig(phase="adapt", vecnorm="eval", entropy_coef_start=0.00, entropy_coef_end=0.00), group="algo")
 cs.store("ppo_haic_finetune", node=PPOConfig(phase="finetune", vecnorm="eval", entropy_coef_start=0.001, entropy_coef_end=0.001), group="algo")
 cs.store("ppo_haic_train_est", node=PPOConfig(phase="train_est", vecnorm="eval", entropy_coef_start=0.00, entropy_coef_end=0.00, in_keys=(CMD_KEY, OBS_KEY, OBJECT_KEY, OBS_PRIV_KEY, DEPTH_KEY)), group="algo")
@@ -220,7 +227,7 @@ class PPOHAIC(TensorDictModuleBase):
         self.cfg = cfg
         self.device = device
         self.observation_spec = observation_spec
-        assert self.cfg.phase in ["train", "adapt", "finetune", "train_est", "adapt_est"]
+        assert self.cfg.phase in ["train", "adapt", "finetune", "train_est", "adapt_est", "latency_command"]
 
         self.entropy_coef = self.cfg.entropy_coef_start
         self.desired_kl = cfg.desired_kl
@@ -241,7 +248,7 @@ class PPOHAIC(TensorDictModuleBase):
         self.value_norm = value_norm_cls(input_shape=num_reward_groups).to(self.device)
         object.__setattr__(self, "env", env)
 
-        self.action_dim = action_spec.shape[-1]
+        self.action_dim = env.action_manager.action_dim if self.cfg.phase == "latency_command" else action_spec.shape[-1]
         self.joint_names = env.action_manager.joint_names
         
         fake_input = observation_spec.zero()
@@ -348,6 +355,36 @@ class PPOHAIC(TensorDictModuleBase):
             in_keys = [CMD_KEY, OBS_KEY, PRIV_PRED_KEY]
         self.actor_adapt = build_actor(in_keys, self.dist_cls, self.dist_keys)
 
+        if cfg.phase == "latency_command":
+            class LatentCommandHead(nn.Module):
+                def __init__(self, latent_dim: int, horizon: int, init_noise_scale: float):
+                    super().__init__()
+                    self.latent_dim = latent_dim
+                    self.horizon = horizon
+                    self.head = Actor(latent_dim * horizon, init_noise_scale=init_noise_scale)
+
+                def forward(self, features, current):
+                    loc, scale = self.head(features)
+                    loc = loc.reshape(features.shape[0], self.horizon, self.latent_dim)
+                    return (loc + current.unsqueeze(1)).reshape(features.shape[0], -1), scale
+
+            command_module = Seq(
+                CatTensors([OBS_KEY, CMD_KEY, PRIV_FEATURE_KEY], "_command_inp", del_keys=False, sort=False),
+                Mod(make_mlp([512, 256, 256]), "_command_inp", ["_command_feature"]),
+                Mod(
+                    LatentCommandHead(self.cfg.latent_dim, self.cfg.command_horizon, self.cfg.init_noise_scale),
+                    ["_command_feature", PRIV_FEATURE_KEY],
+                    self.dist_keys,
+                ),
+            ).to(self.device)
+            self.command_actor = ProbabilisticActor(
+                module=command_module,
+                in_keys=self.dist_keys,
+                out_keys=[ACTION_KEY],
+                distribution_class=self.dist_cls,
+                return_log_prob=True,
+            ).to(self.device)
+
         # build critic
         _critic = nn.Sequential(make_mlp([512, 256, 128]), nn.LazyLinear(num_reward_groups))
         self.critic = Seq(
@@ -417,6 +454,8 @@ class PPOHAIC(TensorDictModuleBase):
         if self.cfg.phase in ["train_est", "adapt_est"]:
             self.estimator(fake_input)
         self.actor_adapt(fake_input)
+        if self.cfg.phase == "latency_command":
+            self.command_actor(fake_input)
         if self.cfg.train_dr_estimator:
             self.dr_estimator(fake_input)
 
@@ -429,6 +468,10 @@ class PPOHAIC(TensorDictModuleBase):
                 nn.init.constant_(module.bias, 0.)
         
         self.apply(init_)
+        if self.cfg.phase == "latency_command":
+            command_head = self.command_actor.module[0][2].module.head.actor_mean
+            nn.init.zeros_(command_head.weight)
+            nn.init.zeros_(command_head.bias)
         self.adapt_ema = copy.deepcopy(self.adapt_module).requires_grad_(False)
         self.object_adapt_ema = copy.deepcopy(self.object_adapt).requires_grad_(False)
 
@@ -436,6 +479,11 @@ class PPOHAIC(TensorDictModuleBase):
         if self.cfg.phase == "train":
             policy_params = [
                     {"params": self.actor.parameters()},
+                    {"params": self.encoder_priv.parameters()},
+                ]
+        elif self.cfg.phase == "latency_command":
+            policy_params = [
+                    {"params": self.command_actor.parameters()},
                     {"params": self.encoder_priv.parameters()},
                 ]
         else:
@@ -519,6 +567,10 @@ class PPOHAIC(TensorDictModuleBase):
         elif self.cfg.phase == "adapt_est":
             modules.append(self.estimator)
             modules.append(self.actor_adapt)
+        elif self.cfg.phase == "latency_command":
+            modules.append(self.object_transform)
+            modules.append(self.encoder_priv)
+            modules.append(self.command_actor)
 
         out_keys = ["sample_log_prob", "action"] + self.dist_keys
         if self.cfg.adapt_module == "gru":
@@ -551,11 +603,16 @@ class PPOHAIC(TensorDictModuleBase):
         elif self.cfg.phase == "adapt_est":
             info.update(self.train_policy(tensordict.copy()))
             info.update(self.train_estimator(tensordict.copy()))
+        elif self.cfg.phase == "latency_command":
+            info.update(self.train_policy(tensordict.copy()))
             
         self.num_updates += 1
 
         actor = self.actor if self.cfg.phase == "train" else self.actor_adapt
-        action_std = actor.module[0][2].module.actor_std.detach()
+        if self.cfg.phase == "latency_command":
+            action_std = self.command_actor.module[0][2].module.head.actor_std.detach()
+        else:
+            action_std = actor.module[0][2].module.actor_std.detach()
         for joint_name, std in zip(self.joint_names, action_std):
             info[f"actor_std/{joint_name}"] = std
         info["actor_std/mean"] = action_std.mean()
@@ -781,18 +838,24 @@ class PPOHAIC(TensorDictModuleBase):
             actor = self.actor_adapt
         elif self.cfg.phase == "adapt_est":
             actor = self.actor_adapt
+        elif self.cfg.phase == "latency_command":
+            self.object_transform(tensordict)
+            self.encoder_priv(tensordict)
+            actor = self.command_actor
         else:
             raise ValueError(f"Invalid phase: {self.cfg.phase}")
 
         dist: D.Independent = actor.get_dist(tensordict)
         log_probs = dist.log_prob(tensordict[ACTION_KEY])
-        entropy = dist.entropy().mean()
 
         if self.cfg.phase == "train":
             valid = (tensordict["step_count"] > 1)
         else:
             valid = (tensordict["step_count"] > 5)
         valid = valid.squeeze(-1)
+        policy_valid = valid
+        if self.cfg.phase == "latency_command":
+            policy_valid = policy_valid & tensordict["next", "command_admitted"].squeeze(-1)
 
         adv = tensordict["adv"]
         log_ratio = (log_probs - tensordict["sample_log_prob"]).unsqueeze(-1)
@@ -803,38 +866,68 @@ class PPOHAIC(TensorDictModuleBase):
             clamped_ratio = ratio.clamp(1.-self.clip_param, 1.+self.clip_param).detach()
             surr1 = surr1 / clamped_ratio
             surr2 = surr2 / clamped_ratio
-        policy_loss = - (torch.min(surr1, surr2)[valid]).mean()
-        entropy_loss = - self.entropy_coef * entropy
+        policy_valid_count = policy_valid.sum()
+        global_policy_count = _global_count(policy_valid)
+        policy_update = global_policy_count.item() > 0
+        if policy_valid.any():
+            policy_loss = - (torch.min(surr1, surr2)[policy_valid]).mean()
+            entropy = dist.entropy()[policy_valid].mean()
+        else:
+            # Keep a zero gradient path on ranks with no admitted samples so
+            # every rank can participate in the same actor all-reduces.
+            policy_loss = surr1.sum() * 0.0
+            entropy = dist.entropy().sum() * 0.0
+        entropy_loss = -self.entropy_coef * entropy
+        if policy_update:
+            policy_loss_weight = (
+                policy_valid_count * aa.get_world_size() / global_policy_count
+            )
+        else:
+            policy_loss_weight = torch.zeros_like(global_policy_count)
 
         b_returns = tensordict["ret"]
         values = self.critic(tensordict)["state_value"]
-        value_loss = self.critic_loss_fn(b_returns, values)
-        value_loss = value_loss[valid].mean(dim=0)
-
-        valid_count = valid.sum()
-        global_valid_count = valid_count.detach().clone()
-        aa.all_reduce(global_valid_count)
-        loss_weight = valid_count * aa.get_world_size() / global_valid_count
-        loss = (policy_loss + value_loss.mean()) * loss_weight + entropy_loss
+        value_losses = self.critic_loss_fn(b_returns, values)
+        if valid.any():
+            value_loss = value_losses[valid].mean(dim=0)
+        else:
+            value_loss = values.sum(dim=0) * 0.0
+        global_valid_count = _global_count(valid)
+        if global_valid_count.item() > 0:
+            value_loss_weight = valid.sum() * aa.get_world_size() / global_valid_count
+        else:
+            value_loss_weight = torch.zeros_like(global_valid_count)
+        loss = (
+            (policy_loss + entropy_loss) * policy_loss_weight
+            + value_loss.mean() * value_loss_weight
+        )
 
         self.opt_policy.zero_grad()
         self.opt_critic.zero_grad()
         loss.backward()
-        if self.cfg.phase == "train":
-            aa.average_gradients(actor, self.encoder_priv, self.critic)
+        if policy_update:
+            if self.cfg.phase in ["train", "latency_command"]:
+                aa.average_gradients(actor, self.encoder_priv)
+            else:
+                aa.average_gradients(actor)
+            actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), self.cfg.max_grad_norm)
+            if self.cfg.phase in ["train", "latency_command"]:
+                priv_grad_norm = nn.utils.clip_grad_norm_(self.encoder_priv.parameters(), self.cfg.max_grad_norm)
+            else:
+                priv_grad_norm = torch.zeros(1, device=self.device)
+            self.opt_policy.step()
         else:
-            aa.average_gradients(actor, self.critic)
-        actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), self.cfg.max_grad_norm)
+            actor_grad_norm = torch.zeros(1, device=self.device)
+            priv_grad_norm = torch.zeros(1, device=self.device)
+        aa.average_gradients(self.critic)
         critic_grad_norm = nn.utils.clip_grad_norm_(self.critic.parameters(), self.cfg.max_grad_norm)
-        if self.cfg.phase == "train":
-            priv_grad_norm = nn.utils.clip_grad_norm_(self.encoder_priv.parameters(), self.cfg.max_grad_norm)
-        else:
-            priv_grad_norm = torch.zeros(1)
-        self.opt_policy.step()
         self.opt_critic.step()
         
         with torch.no_grad():
-            explained_var = 1 - value_loss / b_returns[valid].var(dim=0)
+            if valid.any():
+                explained_var = 1 - value_loss / b_returns[valid].var(dim=0)
+            else:
+                explained_var = torch.zeros_like(value_loss)
             clipfrac = ((ratio - 1.0).abs() > self.clip_param).float().mean()
             # loc, scale = dist.loc, dist.scale
             # kl = torch.sum(
@@ -854,12 +947,14 @@ class PPOHAIC(TensorDictModuleBase):
             "actor/clamp_ratio": clipfrac,
             "actor/kl": kl,
             "actor/priv_grad_norm": priv_grad_norm,
+            "actor/admitted_count": policy_valid_count,
+            "actor/update_applied": torch.tensor(policy_update, device=self.device),
             'actor/approx_kl': ((ratio - 1) - log_ratio).mean(),
             "critic/grad_norm": critic_grad_norm,
         }
         for i, group_name in enumerate(self.reward_groups):
-            info[f"critic/{group_name}.explained_var"] = explained_var[i]
-            info[f"critic/{group_name}.value_loss"] = value_loss[i].detach()
+            info[f"critic/{group_name}.explained_var"] = explained_var.reshape(-1)[i]
+            info[f"critic/{group_name}.value_loss"] = value_loss.reshape(-1)[i].detach()
         return info
 
     def state_dict(self):
@@ -880,27 +975,66 @@ class PPOHAIC(TensorDictModuleBase):
             state_dict[name] = module.state_dict()
         state_dict["last_phase"] = self.cfg.phase
         state_dict["last_iter"] = self.env.current_iter
+        state_dict["num_updates"] = self.num_updates
         state_dict["lr_policy"] = self.lr_policy
+        state_dict["optimizers"] = {
+            "policy": self.opt_policy.state_dict(),
+            "critic": self.opt_critic.state_dict(),
+            "adapt": self.opt_adapt.state_dict(),
+            **(
+                {"adapt_actor": self.opt_adapt_actor.state_dict()}
+                if hasattr(self, "opt_adapt_actor")
+                else {}
+            ),
+            **(
+                {"estimator": self.opt_estimator.state_dict()}
+                if hasattr(self, "opt_estimator")
+                else {}
+            ),
+            **(
+                {"dr_estimator": self.opt_dr_estimator.state_dict()}
+                if hasattr(self, "opt_dr_estimator")
+                else {}
+            ),
+        }
         return state_dict
     
     def load_state_dict(self, state_dict, strict=True):
-        succeed_keys = []
-        failed_keys = []
+        teacher_init = (
+            self.cfg.phase == "latency_command"
+            and state_dict["last_phase"] == "train"
+        )
         for name, module in self.named_children():
-            _state_dict = state_dict.get(name, {})
-            try:
-                module.load_state_dict(_state_dict, strict=strict)
-                succeed_keys.append(name)
-            except Exception as e:
-                warnings.warn(f"Failed to load state dict for {name}: {str(e)}")
-                failed_keys.append(name)
-        print(f"Successfully loaded {succeed_keys}.")
+            if teacher_init and name == "command_actor":
+                continue
+            module.load_state_dict(state_dict[name], strict=True if teacher_init else strict)
 
-        self.env.set_progress(state_dict.get("last_iter", 0))
-        lr_policy = state_dict.get("lr_policy", None)
-        if lr_policy is not None:
-            self.lr_policy = lr_policy
-            for param_group in self.opt_policy.param_groups:
-                param_group["lr"] = self.lr_policy
+        if self.cfg.phase == "latency_command":
+            for name in ("actor", "actor_adapt"):
+                getattr(self, name).module[0][2].module.actor_std.data.copy_(
+                    state_dict[name]["module.0.module.2.module.actor_std"]
+                )
+        if teacher_init:
+            return []
 
-        return failed_keys
+        self.env.set_progress(state_dict["last_iter"])
+        self.lr_policy = state_dict["lr_policy"]
+        for param_group in self.opt_policy.param_groups:
+            param_group["lr"] = self.lr_policy
+
+        if self.cfg.phase != "latency_command":
+            return []
+
+        self.num_updates = state_dict["num_updates"]
+        optimizers = state_dict["optimizers"]
+        for name, optimizer in (
+            ("policy", self.opt_policy),
+            ("critic", self.opt_critic),
+            ("adapt", self.opt_adapt),
+        ):
+            optimizer.load_state_dict(optimizers[name])
+        for name in ("adapt_actor", "estimator", "dr_estimator"):
+            if hasattr(self, f"opt_{name}"):
+                getattr(self, f"opt_{name}").load_state_dict(optimizers[name])
+
+        return []

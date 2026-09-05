@@ -148,6 +148,7 @@ class _Env(EnvBase):
         self.episode_length_buf = torch.zeros(self.num_envs, dtype=int, device=self.device)
         self.episode_count = 0
         self.current_iter = 0
+        self._active_env_ids = torch.arange(self.num_envs, device=self.device)
         self._episode_generators: list[torch.Generator | None] = [None] * self.num_envs
 
         # parse obs and reward functions
@@ -209,9 +210,12 @@ class _Env(EnvBase):
         ):
             self._debug_draw_callbacks.append(self._visualize_camera_rays)
         
+        action_shape = self.action_dim
+        if self.cfg.latency_command:
+            action_shape = int(self.cfg.latency_command_horizon) * int(self.cfg.latent_dim)
         self.action_spec = Composite(
             {
-                "action": UnboundedContinuous((self.num_envs, self.action_dim))
+                "action": UnboundedContinuous((self.num_envs, action_shape))
             },
             shape=[self.num_envs]
         ).to(self.device)
@@ -338,9 +342,22 @@ class _Env(EnvBase):
         self.termination_time = 0.
         self.observation_time = 0.
         self.ema_cnt = 0.
+        self.command_latency = None
+        self.latency_last_submission = None
+        self.latency_last_applied = None
+        self.latency_last_application = None
+        self.latency_last_trace = []
+        self.latency_decoder = None
         
     def set_progress(self, progress: int):
         self.current_iter = progress
+
+    @property
+    def active_env_ids(self) -> torch.Tensor:
+        return self._active_env_ids
+
+    def set_active_env_ids(self, env_ids) -> None:
+        self._active_env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
 
     @property
     def action_dim(self) -> int:
@@ -485,12 +502,109 @@ class _Env(EnvBase):
             # cnt.add_(1.)
         if self.sim.has_gui() and not self.cfg.enable_vla_camera:
             self.sim.render()
-        self.episode_length_buf.add_(1)
+        self.episode_length_buf[self.active_env_ids] += 1
         self.timestamp += 1
         end = time.perf_counter()
         self.update_time = self.update_time * self._stats_ema_decay + (end - start)
 
     def _step(self, tensordict: TensorDictBase) -> TensorDictBase:
+        if self.command_latency is not None:
+            return self._step_latency(tensordict)
+        return self._step_raw(tensordict)
+
+    def _step_latency(self, tensordict: TensorDictBase) -> TensorDictBase:
+        commands = tensordict["action"].reshape(
+            self.num_envs,
+            int(self.cfg.latency_command_horizon),
+            int(self.cfg.latent_dim),
+        )
+        base_active_ids = self.active_env_ids.clone()
+        active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        active[base_active_ids] = True
+        admitted = self.command_latency.submit(commands, env_ids=base_active_ids.tolist())
+        self.latency_last_submission = [
+            self.command_latency.last_submission[env_id].copy()
+            if admitted[env_id].item()
+            else None
+            for env_id in range(self.num_envs)
+        ]
+        gamma = self.cfg.latency_gamma
+        total_reward = None
+        executed_steps = torch.zeros_like(self.discount, dtype=torch.long)
+        terminal_done = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        terminal_values = {}
+        raw_trace = []
+        result = None
+        current = tensordict
+        for frame in range(int(self.cfg.latency_control_repeat)):
+            active_ids = torch.nonzero(active, as_tuple=False).flatten()
+            if not active_ids.numel():
+                break
+            self.set_active_env_ids(active_ids)
+            applied = self.command_latency.actions(env_ids=active_ids.tolist())
+            self.latency_last_applied = applied.detach().clone()
+            self.latency_last_application = [
+                None
+                if application is None
+                else application.copy()
+                for application in self.command_latency.last_application
+            ]
+            motor = self.latency_decoder(applied, current)
+            raw_tensordict = current.clone(False)
+            raw_tensordict["action"] = motor
+            frame_result = self._step_raw(raw_tensordict)
+            result = frame_result
+            raw_trace.append(
+                {
+                    "env_ids": active_ids.detach().clone(),
+                    "applied_command": applied.detach().clone(),
+                    "application": [
+                        self.latency_last_application[env_id]
+                        for env_id in active_ids.tolist()
+                    ],
+                    "reward": frame_result["reward"].detach().clone(),
+                    "done": frame_result["done"].detach().clone(),
+                }
+            )
+            reward = result["reward"]
+            if total_reward is None:
+                total_reward = torch.zeros_like(reward)
+            total_reward[active_ids] += (gamma**frame) * reward[active_ids]
+            executed_steps[active_ids] += 1
+            frame_done = result["done"].squeeze(-1).bool()
+            newly_done = active & frame_done
+            if newly_done.any():
+                for key, value in result.items(include_nested=True, leaves_only=True):
+                    if key not in terminal_values:
+                        terminal_values[key] = value.clone()
+                    else:
+                        terminal_values[key][newly_done] = value[newly_done]
+                terminal_done |= newly_done
+            active &= ~frame_done
+            self.command_latency.advance(env_ids=active_ids.tolist())
+            current = self.latency_observation_norm(result.clone(False))
+        for key, value in result.items(include_nested=True, leaves_only=True):
+            if key in terminal_values:
+                mask = terminal_done
+                while mask.ndim < value.ndim:
+                    mask = mask.unsqueeze(-1)
+                result.set(key, torch.where(mask, terminal_values[key], value))
+        result["reward"] = total_reward
+        # GAE multiplies this field by its configured gamma.  Return the
+        # remaining factor so the bootstrap is exactly gamma**executed_steps,
+        # including macro steps that ended early at a terminal frame.
+        result["discount"] = torch.pow(
+            self.discount.new_full(self.discount.shape, gamma), executed_steps
+        ) / gamma
+        result["command_admitted"] = admitted.unsqueeze(-1)
+        done_ids = terminal_done.nonzero(as_tuple=False).flatten().tolist()
+        if done_ids:
+            self.command_latency.reset(done_ids)
+        self.set_active_env_ids(base_active_ids)
+        self.latency_last_trace = raw_trace
+        return result
+
+    def _step_raw(self, tensordict: TensorDictBase) -> TensorDictBase:
         start = time.perf_counter()
         for substep in range(self.decimation):
             self.apply_action(tensordict, substep)
@@ -610,11 +724,12 @@ class _Env(EnvBase):
         *,
         env_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        env_ids = (
-            torch.arange(self.num_envs, device=self.device)
-            if env_ids is None
-            else env_ids.reshape(-1)
-        )
+        full_value = env_ids is None and value.shape[0] == self.num_envs
+        env_ids = self.active_env_ids if env_ids is None else env_ids.reshape(-1)
+        if full_value and env_ids.numel() != self.num_envs:
+            noise = torch.zeros_like(value)
+            noise[env_ids] = self.random_normal_like(value[env_ids], env_ids=env_ids)
+            return noise
         env_id_list = env_ids.tolist()
         if not any(self._episode_generators[env_id] is not None for env_id in env_id_list):
             return torch.randn_like(value)

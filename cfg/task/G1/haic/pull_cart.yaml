@@ -5,6 +5,12 @@ defaults:
 
 name: G1PullCart
 
+latency_config_path: null
+latency_command_horizon: 40
+latency_control_repeat: 5
+latent_dim: 256
+latency_gamma: 0.99
+
 viewer:
   env_spacing: 5.0
   lookat: [0.5, -2.5, 0.8]

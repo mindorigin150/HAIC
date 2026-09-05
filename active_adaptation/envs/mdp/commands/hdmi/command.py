@@ -326,7 +326,7 @@ class RobotTracking(Command):
             # self.all_marker_pos_w[0] = self.ref_body_pos_future_w[:, 0]
             # self.all_marker_pos_w[1] = self.ref_body_pos_future_w[:, -1]
 
-        self.t += 1
+        self.t[self.env.active_env_ids] += 1
     
     def _init_debug_draw(self):
         if self.env.backend != "isaac":

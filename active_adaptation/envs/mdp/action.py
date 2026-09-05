@@ -87,19 +87,27 @@ class JointPosition(ActionManager):
         self.action_buf[env_ids] = 0
         self.applied_action[env_ids] = 0
 
-        delay = torch.randint(self.min_delay, self.max_delay + 1, (len(env_ids), 1), device=self.device)
+        delay = self.env.random_int(
+            self.min_delay,
+            self.max_delay + 1,
+            (len(env_ids), 1),
+            env_ids=env_ids,
+        )
         self.delay[env_ids] = delay
-        alpha = torch.empty(len(env_ids), 1, device=self.device).uniform_(
-            *self.alpha_range
+        alpha = self.env.random_uniform(
+            *self.alpha_range,
+            (len(env_ids), 1),
+            env_ids=env_ids,
         )
         self.alpha[env_ids] = alpha
 
     def __call__(self, action: torch.Tensor, substep: int):
+        env_ids = self.env.active_env_ids
         if substep == 0:
             if isinstance(action, TensorDictBase):
                 action = action["action"]
-            self.action_buf[:, :, 1:] = self.action_buf[:, :, :-1]
-            self.action_buf[:, :, 0] = action
+            self.action_buf[env_ids, :, 1:] = self.action_buf[env_ids, :, :-1]
+            self.action_buf[env_ids, :, 0] = action[env_ids]
         # if delay = 1
         #     substep = 0, action_dim: 1
         #     substep = 1, action_dim: 0
@@ -112,7 +120,11 @@ class JointPosition(ActionManager):
         #     substep = 3, action_dim: 0
         action_dim = (self.delay - substep + self.env.decimation - 1) // self.env.decimation
         action = self.action_buf.take_along_dim(action_dim.unsqueeze(1), dim=-1)
-        self.applied_action.lerp_(action.squeeze(-1), self.alpha)
+        self.applied_action[env_ids] = torch.lerp(
+            self.applied_action[env_ids],
+            action[env_ids].squeeze(-1),
+            self.alpha[env_ids],
+        )
 
         pos_target = self.default_joint_pos + self.offset
         pos_target[:, self.joint_ids] += self.applied_action * self.action_scaling
