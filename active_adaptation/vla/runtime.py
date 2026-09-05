@@ -87,6 +87,7 @@ def vla_observations(
     rgb: np.ndarray,
     state: np.ndarray,
     slots: Sequence[int],
+    episode_seeds: Sequence[int | None],
     control_step: int,
 ) -> list[Any]:
     """Build parent-process observations for the official GR00T pool."""
@@ -102,9 +103,12 @@ def vla_observations(
                 ENV_RAW_RGB_FRAME_STACK_INFO_KEY: frame[None],
                 "haic_state": state_value,
                 "slot_id": slot,
+                "action_noise_seed": episode_seed,
             },
         )
-        for frame, state_value, slot in zip(rgb, state, slots)
+        for frame, state_value, slot, episode_seed in zip(
+            rgb, state, slots, episode_seeds, strict=True
+        )
     ]
 
 
@@ -113,6 +117,7 @@ def predict_vla(
     rgb: np.ndarray,
     state: np.ndarray,
     slots: Sequence[int],
+    episode_seeds: Sequence[int | None],
     step: int,
     batch_size: int,
 ) -> np.ndarray:
@@ -121,7 +126,7 @@ def predict_vla(
     for start in range(0, len(slots), batch_size):
         batch = slice(start, start + batch_size)
         observations = vla_observations(
-            rgb[batch], state[batch], slots[batch], step
+            rgb[batch], state[batch], slots[batch], episode_seeds[batch], step
         )
         actions.extend(
             np.asarray(output.action_chunk, dtype=np.float32)

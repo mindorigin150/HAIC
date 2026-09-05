@@ -135,9 +135,12 @@ class HaicVlaContractTest(unittest.TestCase):
         )
         state = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
 
-        observations = vla_observations(rgb, state, [2, 7], 11)
+        observations = vla_observations(rgb, state, [2, 7], [101, 102], 11)
 
         self.assertEqual([item.metadata["slot_id"] for item in observations], [2, 7])
+        self.assertEqual(
+            [item.metadata["action_noise_seed"] for item in observations], [101, 102]
+        )
         np.testing.assert_array_equal(
             observations[0].metadata["env_raw_rgb_frame_stack"], rgb[0][None]
         )
@@ -172,6 +175,7 @@ class HaicVlaContractTest(unittest.TestCase):
             np.arange(5, dtype=np.uint8).reshape(5, 1, 1, 1),
             np.arange(5, dtype=np.float32).reshape(5, 1),
             [2, 7, 11, 19, 23],
+            [100, 101, 102, 103, 104],
             step=0,
             batch_size=2,
         )
@@ -239,74 +243,108 @@ class HaicVlaContractTest(unittest.TestCase):
         for name, parameter in actor.state_dict().items():
             torch.testing.assert_close(parameter, exported.state_dict()[name])
 
-    def test_profile_env_maps_vla_latent_through_fixed_actor(self):
+    def test_vector_backend_maps_latent_through_fixed_actor(self):
+        import types
+
+        from active_adaptation.vla.backend import HaicEnvStepBackend
+        from latency_bench.core.types import Action
+
         seen = []
+        actor_inputs = []
+        next_td = _FakeTensorDict(
+            {
+                "done": torch.tensor([[True]]),
+                "truncated": torch.tensor([[False]]),
+                "reward": torch.tensor([[2.0]]),
+                "stats": {"success": torch.tensor([[1]])},
+            }
+        )
+        carry = _FakeTensorDict(
+            {
+                "command": torch.zeros(1, 0),
+                "policy": torch.zeros(1, 605),
+            }
+        )
+        command = types.SimpleNamespace(
+            t=torch.zeros(1, dtype=torch.long),
+            motion_len=torch.full((1,), 3, dtype=torch.long),
+            object=types.SimpleNamespace(
+                data=types.SimpleNamespace(root_link_pos_w=torch.zeros(1, 3))
+            ),
+        )
 
         class Env:
-            device = torch.device("cpu")
+            num_envs = 1
+            base_env = types.SimpleNamespace(
+                device=torch.device("cpu"),
+                step_dt=0.02,
+                command_manager=command,
+            )
 
-            def __init__(self, success):
-                self.success = success
-
-            def step_and_maybe_reset(self, action):
+            def step(self, action):
                 seen.append(action["action"])
-                return (
-                    _FakeTensorDict(
-                        {
-                            "next": _FakeTensorDict(
-                                {
-                                    "done": torch.tensor([[True]]),
-                                    "truncated": torch.tensor([[False]]),
-                                    "reward": torch.tensor([[2.0]]),
-                                    "stats": {
-                                        "success": torch.tensor([[self.success]])
-                                    },
-                                }
-                            )
-                        }
-                    ),
-                    self.carry,
-                )
+                return _FakeTensorDict({"next": next_td})
 
-        class Actor:
-            def __call__(self, actor_input):
-                seen.append(actor_input)
-                return torch.zeros(1, 23)
+            def close(self):
+                pass
 
-        env = Env(True)
-        env.carry = _FakeTensorDict(
+        torchrl = types.ModuleType("torchrl")
+        torchrl_envs = types.ModuleType("torchrl.envs")
+        torchrl_utils = types.ModuleType("torchrl.envs.utils")
+        torchrl_utils.step_mdp = lambda td: td["next"]
+        with patch.dict(
+            sys.modules,
             {
-                "command": torch.zeros(1, 0),
-                "policy": torch.zeros(1, 605),
-            }
-        )
-        adapter = haic_vla._HaicProfileEnv(env, Actor())
-        adapter._carry = env.carry
-        self.assertEqual(seen, [])
-        result = adapter.step(
-            haic_vla.Action(value=np.ones(256, dtype=np.float32))
-        )
+                "torchrl": torchrl,
+                "torchrl.envs": torchrl_envs,
+                "torchrl.envs.utils": torchrl_utils,
+            },
+        ):
+            backend = HaicEnvStepBackend(
+                Env(),
+                lambda actor_input: (
+                    actor_inputs.append(actor_input.clone())
+                    or torch.zeros(1, 23)
+                ),
+            )
+            backend._carry = carry
+            backend._motion_len[0] = torch.tensor(3)
+            backend._cart_start[0] = torch.zeros(3)
+            backend._ref_cart_displacement[0] = torch.ones(3)
+            result = backend.step_slots(
+                {0: Action(value=np.ones(256, dtype=np.float32))}
+            )
 
-        self.assertTrue(result.done)
-        self.assertEqual(result.reward, 2.0)
-        self.assertEqual(result.info, {"task_metrics": {"success": 1}})
-        self.assertEqual(seen[0].shape, (1, 861))
-        np.testing.assert_array_equal(seen[0][0, 605:].numpy(), np.ones(256))
-        self.assertEqual(seen[1].shape, (1, 23))
+        self.assertTrue(result[0].result.done)
+        self.assertEqual(result[0].result.reward, 2.0)
+        self.assertEqual(result[0].result.info["task_metrics"]["success"], 1)
+        np.testing.assert_array_equal(actor_inputs[0][0, 605:].numpy(), np.ones(256))
+        self.assertEqual(seen[0].shape, (1, 23))
 
-        env = Env(False)
-        env.carry = _FakeTensorDict(
-            {
-                "command": torch.zeros(1, 0),
-                "policy": torch.zeros(1, 605),
-            }
+    def test_latency_eval_leaves_policy_in_common_executor(self):
+        config = {
+            "executor": {"inference_devices": ["cuda:0"]},
+            "logging": {"output_dir": "output"},
+        }
+        backend = object()
+        with patch(
+            "active_adaptation.vla.backend.build_haic_env_backend",
+            return_value=backend,
+        ) as build_backend, patch(
+            "latency_bench.eval.driver.run_from_config"
+        ) as run_from_config:
+            self.assertEqual(
+                haic_vla._run_latency_eval(config, object(), object()),
+                {"output_dir": "output"},
+            )
+
+        build_backend.assert_called_once()
+        run_from_config.assert_called_once_with(
+            config,
+            env_backend=backend,
+            policy=None,
+            inference_devices=["cuda:0"],
         )
-        adapter = haic_vla._HaicProfileEnv(env, Actor())
-        adapter._carry = env.carry
-        result = adapter.step(
-            haic_vla.Action(value=np.ones(256, dtype=np.float32))
-        )
-        self.assertEqual(result.info, {"task_metrics": {"success": 0}})
 
     def test_dagger_flush_preserves_per_step_action_distillation(self):
         row = {
@@ -352,6 +390,7 @@ class HaicVlaContractTest(unittest.TestCase):
         args = SimpleNamespace(
             output_dir=Path(),
             mode="dagger-collect",
+            seed=0,
             row_budget=1,
             dagger_round=0,
             vla_cadence=2,
@@ -364,7 +403,7 @@ class HaicVlaContractTest(unittest.TestCase):
             count = 1 if slots is None else len(slots)
             return np.zeros((count, 1, 1, 3), dtype=np.uint8)
 
-        def predict_vla(_pool, _rgb, _state, slots, _step, _batch_size):
+        def predict_vla(_pool, _rgb, _state, slots, _episode_seeds, _step, _batch_size):
             return np.zeros((len(slots), 40, 256), dtype=np.float32)
 
         with patch.object(haic_vla, "_new_pool", return_value=_FakePool()), patch.object(
@@ -393,161 +432,6 @@ class HaicVlaContractTest(unittest.TestCase):
 
         self.assertEqual(refresh_calls, [(None, 50)])
         self.assertEqual(result["rows"], 1)
-
-    def test_dagger_eval_counts_only_first_done_per_env(self):
-        env = _FakeEvalEnv([1, 2])
-        prediction_slots = []
-
-        def predict_vla(_pool, _rgb, _state, slots, _step, _batch_size):
-            prediction_slots.append(tuple(slots))
-            return np.zeros((len(slots), 40, 256), dtype=np.float32)
-
-        args = SimpleNamespace(
-            max_steps=3,
-            output_dir=Path(),
-            mode="dagger-eval",
-            vla_cadence=1,
-            inference_batch_size=2,
-        )
-        with patch.object(haic_vla, "_new_pool", return_value=_FakePool()), patch.object(
-            runtime, "canonical_state", return_value=torch.zeros(2, 2)
-        ), patch.object(
-            runtime,
-            "refresh_rgb",
-            return_value=np.zeros((2, 1, 1, 3), dtype=np.uint8),
-        ), patch.object(runtime, "predict_vla", side_effect=predict_vla), patch.object(
-            runtime, "student_actor_from_policy", return_value=_FakeActor()
-        ):
-            with tempfile.TemporaryDirectory() as output_dir:
-                args.output_dir = Path(output_dir)
-                result = haic_vla._dagger_eval(
-                    args, env, SimpleNamespace(), SimpleNamespace()
-                )
-                self.assertEqual(result["episodes"], 2)
-                self.assertEqual(result["successes"], 2)
-                self.assertEqual(result["success_rate"], 1.0)
-                self.assertEqual(
-                    result["motion_progress"], {"mean": 0.25, "std": 0.25}
-                )
-                self.assertEqual(
-                    result["cart_progress"], {"mean": 0.25, "std": 0.25}
-                )
-                self.assertEqual(
-                    result["pullcart_score"], {"mean": 25.0, "std": 25.0}
-                )
-                self.assertNotIn("steps", result)
-                self.assertEqual(prediction_slots, [(0, 1), (1,)])
-                self.assertEqual(env.events[:2], ["eval", "reset"])
-
-    def test_dagger_eval_consumes_distinct_action_chunk_steps(self):
-        env = _FakeEvalEnv([3])
-        consumed = []
-
-        class RecordingActor:
-            def __call__(self, actor_input):
-                consumed.append(actor_input[:, 605:].clone())
-                return torch.zeros(actor_input.shape[0], 23)
-
-        def predict_vla(_pool, _rgb, _state, slots, _step, _batch_size):
-            chunk = np.arange(40, dtype=np.float32)[:, None]
-            return np.repeat(np.repeat(chunk[None], len(slots), axis=0), 256, axis=2)
-
-        args = SimpleNamespace(
-            max_steps=3,
-            output_dir=Path(),
-            mode="dagger-eval",
-            vla_cadence=5,
-            inference_batch_size=1,
-        )
-        with patch.object(haic_vla, "_new_pool", return_value=_FakePool()), patch.object(
-            runtime, "canonical_state", return_value=torch.zeros(1, 605)
-        ), patch.object(
-            runtime,
-            "refresh_rgb",
-            return_value=np.zeros((1, 1, 1, 3), dtype=np.uint8),
-        ), patch.object(runtime, "predict_vla", side_effect=predict_vla), patch.object(
-            runtime, "student_actor_from_policy", return_value=RecordingActor()
-        ):
-            with tempfile.TemporaryDirectory() as output_dir:
-                args.output_dir = Path(output_dir)
-                result = haic_vla._dagger_eval(
-                    args, env, SimpleNamespace(), SimpleNamespace()
-                )
-
-        self.assertEqual([int(item[0, 0].item()) for item in consumed], [0, 1, 2])
-        self.assertEqual(result["motion_progress"]["mean"], 1.0)
-        self.assertEqual(result["cart_progress"]["mean"], 1.0)
-        self.assertEqual(result["pullcart_score"]["mean"], 100.0)
-
-    def test_dagger_eval_clamps_cart_progress(self):
-        class OutOfRangeCartEnv(_FakeEvalEnv):
-            def step_and_maybe_reset(self, action):
-                result = super().step_and_maybe_reset(action)
-                if self.step_count == 1:
-                    self.base_env.command_manager.object.data.root_link_pos_w[:, 0] = (
-                        torch.tensor([-0.5, 1.5])
-                    )
-                return result
-
-        env = OutOfRangeCartEnv([2, 2])
-        args = SimpleNamespace(
-            max_steps=2,
-            output_dir=Path(),
-            mode="dagger-eval",
-            vla_cadence=1,
-            inference_batch_size=2,
-        )
-        with patch.object(haic_vla, "_new_pool", return_value=_FakePool()), patch.object(
-            runtime, "canonical_state", return_value=torch.zeros(2, 2)
-        ), patch.object(
-            runtime,
-            "refresh_rgb",
-            return_value=np.zeros((2, 1, 1, 3), dtype=np.uint8),
-        ), patch.object(
-            runtime,
-            "predict_vla",
-            return_value=np.zeros((2, 40, 256), dtype=np.float32),
-        ), patch.object(
-            runtime, "student_actor_from_policy", return_value=_FakeActor()
-        ):
-            with tempfile.TemporaryDirectory() as output_dir:
-                args.output_dir = Path(output_dir)
-                result = haic_vla._dagger_eval(
-                    args, env, SimpleNamespace(), SimpleNamespace()
-                )
-
-        self.assertEqual(result["cart_progress"], {"mean": 0.5, "std": 0.5})
-        self.assertEqual(result["pullcart_score"], {"mean": 50.0, "std": 25.0})
-
-    def test_dagger_eval_does_not_write_partial_result(self):
-        env = _FakeEvalEnv([1, 3])
-
-        def predict_vla(_pool, _rgb, _state, slots, _step, _batch_size):
-            return np.zeros((len(slots), 40, 256), dtype=np.float32)
-
-        args = SimpleNamespace(
-            max_steps=2,
-            output_dir=Path(),
-            mode="dagger-eval",
-            vla_cadence=1,
-            inference_batch_size=2,
-        )
-        with patch.object(haic_vla, "_new_pool", return_value=_FakePool()), patch.object(
-            runtime, "canonical_state", return_value=torch.zeros(2, 2)
-        ), patch.object(
-            runtime,
-            "refresh_rgb",
-            return_value=np.zeros((2, 1, 1, 3), dtype=np.uint8),
-        ), patch.object(
-            runtime,
-            "predict_vla",
-            side_effect=predict_vla,
-        ), patch.object(runtime, "student_actor_from_policy", return_value=_FakeActor()):
-            with tempfile.TemporaryDirectory() as output_dir:
-                args.output_dir = Path(output_dir)
-                with self.assertRaisesRegex(RuntimeError, "1/2 episodes"):
-                    haic_vla._dagger_eval(args, env, SimpleNamespace(), SimpleNamespace())
-                self.assertFalse((args.output_dir / "dagger-eval.json").exists())
 
     def test_oracle_eval_uses_the_fixed_actor_without_a_vla_pool(self):
         env = _FakeEvalEnv([1, 2])
