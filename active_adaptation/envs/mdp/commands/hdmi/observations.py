@@ -17,6 +17,10 @@ quat_apply = batchify(quat_apply)
 
 RobotTrackObservation = BaseObservation[RobotTracking]
 
+
+def random_noise(x: torch.Tensor, std: float, env):
+    return x + env.random_normal_like(x).clamp(-3.0, 3.0) * std
+
 class ref_joint_pos_future(RobotTrackObservation):
     def compute(self):
         return self.command_manager.ref_joint_pos_future_.view(self.num_envs, -1)
@@ -353,11 +357,20 @@ class ref_contact_pos_b(RobotObjectTrackObservation):
     
     def reset(self, env_ids):
         if self.episodic_noise_std > 0.0:
-            self.episodic_noise[env_ids] = torch.empty(len(env_ids), *self.command_manager.contact_target_pos_w.shape[1:], device=self.device).uniform_(-1, 1) * self.episodic_noise_std
+            self.episodic_noise[env_ids] = self.env.random_uniform(
+                -1.0,
+                1.0,
+                (len(env_ids), *self.command_manager.contact_target_pos_w.shape[1:]),
+                env_ids=env_ids,
+            ) * self.episodic_noise_std
     
     def update(self):
         if self.noise_std > 0.0:
-            self.step_noise = torch.randn_like(self.command_manager.contact_target_pos_w).clamp(-3, 3) * self.noise_std
+            self.step_noise = random_noise(
+                self.command_manager.contact_target_pos_w,
+                self.noise_std,
+                self.env,
+            ) - self.command_manager.contact_target_pos_w
 
         ref_contact_target_pos_w = self.command_manager.contact_target_pos_w # shape: [num_envs, n, 3]
         robot_root_pos_w = self.command_manager.robot_root_pos_w[:, None, :] # shape: [num_envs, 1, 3]
@@ -368,8 +381,9 @@ class ref_contact_pos_b(RobotObjectTrackObservation):
 
         ref_contact_pos_b = quat_apply_inverse(robot_root_quat_w, ref_contact_target_pos_w - robot_root_pos_w)
         if self.noise_std > 0.0:
-            noise = torch.randn_like(ref_contact_pos_b).clamp(-1, 1) * self.noise_std
-            ref_contact_pos_b += noise
+            ref_contact_pos_b = ref_contact_pos_b + self.env.random_normal_like(
+                ref_contact_pos_b
+            ).clamp(-1.0, 1.0) * self.noise_std
         self.ref_contact_pos_b = ref_contact_pos_b + self.episodic_noise + self.step_noise
 
     def compute(self):
@@ -409,11 +423,16 @@ class object_xy_b(RobotObjectTrackObservation):
 
     def reset(self, env_ids):
         if self.episodic_noise_std > 0.0:
-            self.episodic_noise[env_ids] = torch.empty(len(env_ids), 2, device=self.device).uniform_(-1, 1) * self.episodic_noise_std
+            self.episodic_noise[env_ids] = self.env.random_uniform(
+                -1.0,
+                1.0,
+                (len(env_ids), 2),
+                env_ids=env_ids,
+            ) * self.episodic_noise_std
 
     def update(self):
         if self.noise_std > 0.0:
-            self.step_noise = torch.randn_like(self.object_xy_b).clamp(-3, 3) * self.noise_std
+            self.step_noise = random_noise(self.object_xy_b, self.noise_std, self.env) - self.object_xy_b
         object_pos_w = self.command_manager.object.data.root_link_pos_w # shape: [num_envs, 3]
         robot_root_pos_w = self.command_manager.robot_root_pos_w # shape: [num_envs, 3]
         robot_root_quat_w = self.command_manager.robot_root_quat_w # shape: [num_envs, 4]
@@ -439,11 +458,16 @@ class object_heading_b(RobotObjectTrackObservation):
 
     def reset(self, env_ids):
         if self.episodic_noise_std > 0.0:
-            self.episodic_noise[env_ids] = torch.empty(len(env_ids), 1, device=self.device).uniform_(-1, 1) * self.episodic_noise_std
+            self.episodic_noise[env_ids] = self.env.random_uniform(
+                -1.0,
+                1.0,
+                (len(env_ids), 1),
+                env_ids=env_ids,
+            ) * self.episodic_noise_std
 
     def update(self):
         if self.noise_std > 0.0:
-            self.step_noise = torch.randn_like(self.object_yaw_b).clamp(-3, 3) * self.noise_std
+            self.step_noise = random_noise(self.object_yaw_b, self.noise_std, self.env) - self.object_yaw_b
         object_quat_w = self.command_manager.object.data.root_link_quat_w # shape: [num_envs, 4]
         robot_root_quat_w = self.command_manager.robot_root_quat_w # shape: [num_envs, 4]
 

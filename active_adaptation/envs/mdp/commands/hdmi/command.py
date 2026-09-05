@@ -129,7 +129,12 @@ class RobotTracking(Command):
                 # round-robin assignment to ensure uniform distribution across motions
                 motion_ids = torch.arange(len(env_ids), device=self.device) % self.dataset.num_motions
             else:
-                motion_ids = torch.randint(0, self.dataset.num_motions, size=(len(env_ids),), device=self.device)
+                motion_ids = self.env.random_int(
+                    0,
+                    self.dataset.num_motions,
+                    (len(env_ids),),
+                    env_ids=env_ids,
+                )
             self.motion_ids[env_ids] = motion_ids
             self.motion_len[env_ids] = motion_len = self.dataset.lengths[motion_ids]
             self.motion_starts[env_ids] = self.dataset.starts[motion_ids]
@@ -140,10 +145,20 @@ class RobotTracking(Command):
 
         if self.reset_range is None:
             max_len = motion_len - self.future_steps[-1]
-            start_phase = torch.rand(len(env_ids), device=self.device)
+            start_phase = self.env.random_uniform(
+                0.0,
+                1.0,
+                (len(env_ids),),
+                env_ids=env_ids,
+            )
             start_t = (start_phase * max_len).long()
         else:
-            start_t = torch.randint(*self.reset_range, (len(env_ids),), device=self.device)
+            start_t = self.env.random_int(
+                self.reset_range[0],
+                self.reset_range[1],
+                (len(env_ids),),
+                env_ids=env_ids,
+            )
             
         if not self.env.training or self.record_motion:
             start_t.fill_(0)
@@ -169,7 +184,12 @@ class RobotTracking(Command):
         init_root_ang_vel = motion.body_ang_vel_w[:, self.root_body_idx_motion]
 
         # poses
-        rand_samples = sample_uniform(self.pose_range[:, 0], self.pose_range[:, 1], (len(env_ids), 6), device=self.device)
+        rand_samples = self.env.random_uniform(
+            self.pose_range[:, 0],
+            self.pose_range[:, 1],
+            (len(env_ids), 6),
+            env_ids=env_ids,
+        )
         if not self.env.training:
             rand_samples.fill_(0.0)
         init_root_pos = init_root_pos + self.env.scene.env_origins[env_ids] + rand_samples[:, 0:3]
@@ -177,7 +197,12 @@ class RobotTracking(Command):
         init_root_quat = quat_mul(init_root_quat, orientations_delta)
 
         # velocities
-        rand_samples = sample_uniform(self.velocity_range[:, 0], self.velocity_range[:, 1], (len(env_ids), 6), device=self.device)
+        rand_samples = self.env.random_uniform(
+            self.velocity_range[:, 0],
+            self.velocity_range[:, 1],
+            (len(env_ids), 6),
+            env_ids=env_ids,
+        )
         if not self.env.training:
             rand_samples.fill_(0.0)
         velocities = torch.cat([init_root_lin_vel, init_root_ang_vel], dim=-1) + rand_samples
@@ -188,8 +213,18 @@ class RobotTracking(Command):
         init_joint_pos = motion.joint_pos[:, self.asset_joint_idx_motion]
         init_joint_vel = motion.joint_vel[:, self.asset_joint_idx_motion]
 
-        joint_pos_noise = sample_uniform(-1, 1, (init_joint_pos.shape[0], init_joint_pos.shape[1]), device=self.device) * self.init_joint_pos_noise
-        joint_vel_noise = sample_uniform(-1, 1, (init_joint_vel.shape[0], init_joint_vel.shape[1]), device=self.device) * self.init_joint_vel_noise
+        joint_pos_noise = self.env.random_uniform(
+            -1,
+            1,
+            (init_joint_pos.shape[0], init_joint_pos.shape[1]),
+            env_ids=env_ids,
+        ) * self.init_joint_pos_noise
+        joint_vel_noise = self.env.random_uniform(
+            -1,
+            1,
+            (init_joint_vel.shape[0], init_joint_vel.shape[1]),
+            env_ids=env_ids,
+        ) * self.init_joint_vel_noise
 
         init_joint_pos += joint_pos_noise
         init_joint_vel += joint_vel_noise
@@ -649,7 +684,12 @@ class RobotObjectTracking(RobotTracking):
         init_object_pos = self._motion_reset.body_pos_w[:, self.object_body_id_motion]
         init_object_quat = self._motion_reset.body_quat_w[:, self.object_body_id_motion]
 
-        rand_samples = sample_uniform(self.object_pose_range[:, 0], self.object_pose_range[:, 1], (len(env_ids), 6), device=self.device)
+        rand_samples = self.env.random_uniform(
+            self.object_pose_range[:, 0],
+            self.object_pose_range[:, 1],
+            (len(env_ids), 6),
+            env_ids=env_ids,
+        )
 
         init_object_pos += rand_samples[:, 0:3]
         orientations_delta = quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
@@ -666,7 +706,12 @@ class RobotObjectTracking(RobotTracking):
         if self.object2 is not None:
             init_object2_pos = self._motion_reset.body_pos_w[:, self.object2_body_id_motion]
             init_object2_quat = self._motion_reset.body_quat_w[:, self.object2_body_id_motion]
-            rand_samples = sample_uniform(self.object2_pose_range[:, 0], self.object2_pose_range[:, 1], (len(env_ids), 6), device=self.device)
+            rand_samples = self.env.random_uniform(
+                self.object2_pose_range[:, 0],
+                self.object2_pose_range[:, 1],
+                (len(env_ids), 6),
+                env_ids=env_ids,
+            )
             init_object2_pos += rand_samples[:, 0:3]
             orientations_delta = quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
             init_object2_quat = quat_mul(init_object2_quat, orientations_delta)
@@ -713,8 +758,18 @@ class RobotObjectTracking(RobotTracking):
             init_joint_pos = self._motion_reset.joint_pos[:, self.object_joint_idx_motion]
             init_joint_vel = self._motion_reset.joint_vel[:, self.object_joint_idx_motion]
 
-            joint_pos_noise = sample_uniform(-1, 1, (init_joint_pos.shape[0], init_joint_pos.shape[1]), device=self.device) * self.object_init_joint_pos_noise
-            joint_vel_noise = sample_uniform(-1, 1, (init_joint_vel.shape[0], init_joint_vel.shape[1]), device=self.device) * self.object_init_joint_vel_noise
+            joint_pos_noise = self.env.random_uniform(
+                -1,
+                1,
+                (init_joint_pos.shape[0], init_joint_pos.shape[1]),
+                env_ids=env_ids,
+            ) * self.object_init_joint_pos_noise
+            joint_vel_noise = self.env.random_uniform(
+                -1,
+                1,
+                (init_joint_vel.shape[0], init_joint_vel.shape[1]),
+                env_ids=env_ids,
+            ) * self.object_init_joint_vel_noise
             
             init_joint_pos += joint_pos_noise
             init_joint_vel += joint_vel_noise
@@ -730,8 +785,18 @@ class RobotObjectTracking(RobotTracking):
             init_joint_pos = self._motion_reset.joint_pos[:, self.object2_joint_idx_motion]
             init_joint_vel = self._motion_reset.joint_vel[:, self.object2_joint_idx_motion]
 
-            joint_pos_noise = sample_uniform(-1, 1, (init_joint_pos.shape[0], init_joint_pos.shape[1]), device=self.device) * self.object_init_joint_pos_noise
-            joint_vel_noise = sample_uniform(-1, 1, (init_joint_vel.shape[0], init_joint_vel.shape[1]), device=self.device) * self.object_init_joint_vel_noise
+            joint_pos_noise = self.env.random_uniform(
+                -1,
+                1,
+                (init_joint_pos.shape[0], init_joint_pos.shape[1]),
+                env_ids=env_ids,
+            ) * self.object_init_joint_pos_noise
+            joint_vel_noise = self.env.random_uniform(
+                -1,
+                1,
+                (init_joint_vel.shape[0], init_joint_vel.shape[1]),
+                env_ids=env_ids,
+            ) * self.object_init_joint_vel_noise
             
             init_joint_pos += joint_pos_noise
             init_joint_vel += joint_vel_noise

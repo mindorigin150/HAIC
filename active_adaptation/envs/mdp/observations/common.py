@@ -8,8 +8,13 @@ if TYPE_CHECKING:
     from isaaclab.assets import Articulation
     from isaaclab.sensors import ContactSensor
 
-def random_noise(x: torch.Tensor, std: float):
-    return x + torch.randn_like(x).clamp(-3., 3.) * std
+def random_noise(x: torch.Tensor, std: float, env=None, *, env_ids=None):
+    noise = (
+        env.random_normal_like(x, env_ids=env_ids)
+        if env is not None
+        else torch.randn_like(x)
+    )
+    return x + noise.clamp(-3., 3.) * std
 
 class root_ang_vel_history(Observation):
     def __init__(self, env, noise_std: float=0., history_steps: list[int]=[1]):
@@ -25,13 +30,18 @@ class root_ang_vel_history(Observation):
         root_ang_vel_b = self.asset.data.root_ang_vel_b[env_ids]
         root_ang_vel_b = root_ang_vel_b.unsqueeze(1).expand(-1, self.buffer.shape[1], -1)
         if self.noise_std > 0:
-            root_ang_vel_b = random_noise(root_ang_vel_b, self.noise_std)
+            root_ang_vel_b = random_noise(
+                root_ang_vel_b,
+                self.noise_std,
+                self.env,
+                env_ids=env_ids,
+            )
         self.buffer[env_ids] = root_ang_vel_b
 
     def update(self):
         root_ang_vel_b = self.asset.data.root_ang_vel_b
         if self.noise_std > 0:
-            root_ang_vel_b = random_noise(root_ang_vel_b, self.noise_std)
+            root_ang_vel_b = random_noise(root_ang_vel_b, self.noise_std, self.env)
         self.buffer = self.buffer.roll(1, dims=1)
         self.buffer[:, 0] = root_ang_vel_b
 
@@ -52,14 +62,19 @@ class projected_gravity_history(Observation):
         projected_gravity_b = self.asset.data.projected_gravity_b[env_ids]
         projected_gravity_b = projected_gravity_b.unsqueeze(1).expand(-1, self.buffer.shape[1], -1)
         if self.noise_std > 0:
-            projected_gravity_b = random_noise(projected_gravity_b, self.noise_std)
+            projected_gravity_b = random_noise(
+                projected_gravity_b,
+                self.noise_std,
+                self.env,
+                env_ids=env_ids,
+            )
             projected_gravity_b = projected_gravity_b / projected_gravity_b.norm(dim=-1, keepdim=True)
         self.buffer[env_ids] = self.asset.data.projected_gravity_b[env_ids].unsqueeze(1)
     
     def update(self):
         projected_gravity_b = self.asset.data.projected_gravity_b
         if self.noise_std > 0:
-            projected_gravity_b = random_noise(projected_gravity_b, self.noise_std)
+            projected_gravity_b = random_noise(projected_gravity_b, self.noise_std, self.env)
             projected_gravity_b = projected_gravity_b / projected_gravity_b.norm(dim=-1, keepdim=True)
         self.buffer = self.buffer.roll(1, dims=1)
         self.buffer[:, 0] = projected_gravity_b
@@ -111,7 +126,7 @@ class joint_pos_history(Observation):
         self.buffer = self.buffer.roll(1, 1)
         joint_pos = self.joint_pos.mean(1)
         if self.noise_std > 0:
-            joint_pos = random_noise(joint_pos, self.noise_std)
+            joint_pos = random_noise(joint_pos, self.noise_std, self.env)
         self.buffer[:, 0] = joint_pos
     
     def compute(self):

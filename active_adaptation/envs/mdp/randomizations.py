@@ -479,13 +479,27 @@ class push(Randomization):
     def step(self, substep):
         if substep == 0:
             t = self.env.episode_length_buf.view(self.env.num_envs, 1, 1)
-            i = torch.rand(self.env.num_envs, len(self.body_indices), 1, device=self.env.device) < 0.02
+            env_ids = torch.arange(self.env.num_envs, device=self.env.device)
+            i = self.env.random_uniform(
+                0.0,
+                1.0,
+                (self.env.num_envs, len(self.body_indices), 1),
+                env_ids=env_ids,
+            ) < 0.02
             i = i & ((t - self.last_push) > self.min_interval)
             self.last_push = torch.where(i, t, self.last_push)
 
             push_forces = torch.zeros_like(self.forces)
-            push_forces[:, :, 0].uniform_(*self.force_range)
-            push_forces[:, :, 1].uniform_(*self.force_range)
+            push_forces[:, :, 0] = self.env.random_uniform(
+                *self.force_range,
+                (self.env.num_envs, len(self.body_indices)),
+                env_ids=env_ids,
+            )
+            push_forces[:, :, 1] = self.env.random_uniform(
+                *self.force_range,
+                (self.env.num_envs, len(self.body_indices)),
+                env_ids=env_ids,
+            )
             self.forces = torch.where(i, push_forces * self.default_mass_total, self.forces * self.decay)
         self.asset.permanent_wrench_composer.set_forces_and_torques(self.forces, self.torques, body_ids=self.body_indices)
 
@@ -740,7 +754,13 @@ class random_joint_offset(Randomization):
         self.action_manager = self.env.action_manager
 
     def reset(self, env_ids: torch.Tensor):
-        offset = uniform(self.offset_range[env_ids, :, 0], self.offset_range[env_ids, :, 1])
+        offset_range = self.offset_range[env_ids]
+        offset = self.env.random_uniform(
+            offset_range[:, :, 0],
+            offset_range[:, :, 1],
+            tuple(offset_range.shape[:2]),
+            env_ids=env_ids,
+        )
         self.action_manager.offset[env_ids.unsqueeze(1), self.joint_ids] = offset
 
 

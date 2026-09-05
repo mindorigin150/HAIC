@@ -227,16 +227,32 @@ class object_joint_randomization(RobotObjectTrackRandomization):
 
     def reset(self, env_ids: torch.Tensor):
         if self.friction_range is not None:
-            joint_friction = sample_uniform(*self.friction_range, (len(env_ids),), self.device)
+            joint_friction = self.env.random_uniform(
+                *self.friction_range,
+                (len(env_ids),),
+                env_ids=env_ids,
+            )
             self.object._custom_friction[env_ids] = joint_friction
         if self.damping_range is not None:
-            joint_damping = sample_uniform(*self.damping_range, (len(env_ids),), self.device)
+            joint_damping = self.env.random_uniform(
+                *self.damping_range,
+                (len(env_ids),),
+                env_ids=env_ids,
+            )
             self.object._custom_damping[env_ids] = joint_damping
         if self.friction2_range is not None:
-            joint_friction2 = sample_uniform(*self.friction2_range, (len(env_ids),), self.device)
+            joint_friction2 = self.env.random_uniform(
+                *self.friction2_range,
+                (len(env_ids),),
+                env_ids=env_ids,
+            )
             self.object2._custom_friction[env_ids] = joint_friction2
         if self.damping2_range is not None: 
-            joint_damping2 = sample_uniform(*self.damping2_range, (len(env_ids),), self.device)
+            joint_damping2 = self.env.random_uniform(
+                *self.damping2_range,
+                (len(env_ids),),
+                env_ids=env_ids,
+            )
             self.object2._custom_damping[env_ids] = joint_damping2
 
 # class keypoint_virtual_force(RobotTrackRandomization):

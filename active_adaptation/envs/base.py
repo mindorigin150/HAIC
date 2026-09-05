@@ -148,6 +148,7 @@ class _Env(EnvBase):
         self.episode_length_buf = torch.zeros(self.num_envs, dtype=int, device=self.device)
         self.episode_count = 0
         self.current_iter = 0
+        self._episode_generators: list[torch.Generator | None] = [None] * self.num_envs
 
         # parse obs and reward functions
         self.done_spec = Composite(
@@ -568,6 +569,99 @@ class _Env(EnvBase):
         # import omni.replicator.core as rep
         # rep.set_global_seed(seed)
         torch.manual_seed(seed)
+
+    def set_episode_seed(self, env_id: int, seed: int | None) -> None:
+        if seed is None:
+            self._episode_generators[int(env_id)] = None
+            return
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(int(seed))
+        self._episode_generators[int(env_id)] = generator
+
+    def random_uniform(
+        self,
+        low,
+        high,
+        shape: tuple[int, ...],
+        *,
+        env_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        env_ids = env_ids.reshape(-1)
+        low = torch.as_tensor(low, device=self.device)
+        high = torch.as_tensor(high, device=self.device)
+        if not any(self._episode_generators[env_id] is not None for env_id in env_ids.tolist()):
+            return torch.rand(shape, device=self.device) * (high - low) + low
+        values = []
+        for env_id in env_ids.tolist():
+            generator = self._episode_generators[env_id]
+            if generator is None:
+                sample = torch.rand(shape[1:], device=self.device)
+            else:
+                sample = torch.rand(shape[1:], device=self.device, generator=generator)
+            index = len(values)
+            low_value = low[index] if low.ndim == len(shape) else low
+            high_value = high[index] if high.ndim == len(shape) else high
+            values.append(sample * (high_value - low_value) + low_value)
+        return torch.stack(values)
+
+    def random_normal_like(
+        self,
+        value: torch.Tensor,
+        *,
+        env_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        env_ids = (
+            torch.arange(self.num_envs, device=self.device)
+            if env_ids is None
+            else env_ids.reshape(-1)
+        )
+        env_id_list = env_ids.tolist()
+        if not any(self._episode_generators[env_id] is not None for env_id in env_id_list):
+            return torch.randn_like(value)
+        values = []
+        for index, env_id in enumerate(env_id_list):
+            generator = self._episode_generators[env_id]
+            sample_shape = value[index].shape
+            if generator is None:
+                values.append(torch.randn(sample_shape, device=value.device, dtype=value.dtype))
+            else:
+                values.append(
+                    torch.randn(
+                        sample_shape,
+                        device=value.device,
+                        dtype=value.dtype,
+                        generator=generator,
+                    )
+                )
+        return torch.stack(values)
+
+    def random_int(
+        self,
+        low: int,
+        high: int,
+        shape: tuple[int, ...],
+        *,
+        env_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        env_ids = env_ids.reshape(-1)
+        values = []
+        if not any(self._episode_generators[env_id] is not None for env_id in env_ids.tolist()):
+            return torch.randint(low, high, shape, device=self.device)
+        for env_id in env_ids.tolist():
+            generator = self._episode_generators[env_id]
+            if generator is None:
+                values.append(torch.randint(low, high, shape[1:], device=self.device))
+            else:
+                values.append(
+                    torch.randint(
+                        low,
+                        high,
+                        shape[1:],
+                        device=self.device,
+                        generator=generator,
+                    )
+                )
+        return torch.stack(values)
 
     def render(self, mode: str = "human"):
         self.sim.render()
