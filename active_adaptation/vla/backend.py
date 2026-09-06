@@ -42,10 +42,11 @@ class HaicEnvStepBackend:
 
     backend_name = "haic_vector"
 
-    def __init__(self, env, actor):
+    def __init__(self, env, actor, *, obs_fps=10):
         self.env = env
         self.base_env = env.base_env
         self.actor = actor
+        self.obs_fps = obs_fps
         self._carry = None
         self._env_steps = np.zeros(env.num_envs, dtype=np.int64)
         self._episode_ids: list[int | None] = [None] * env.num_envs
@@ -101,7 +102,7 @@ class HaicEnvStepBackend:
 
     def observe_slots(self, slot_ids: Sequence[int]) -> dict[int, Observation]:
         slot_ids = [int(slot_id) for slot_id in slot_ids]
-        frames = refresh_rgb(self.env)
+        frames = refresh_rgb(self.env, update_hz=self.obs_fps)
         state = canonical_state(self._carry).detach().cpu().numpy()
         observations = {
             slot_id: self._make_observation(slot_id, frames[slot_id], state[slot_id])
@@ -236,7 +237,7 @@ class HaicEnvStepBackend:
         ).clone()
 
     def _observation(self, slot_id: int) -> Observation:
-        frames = refresh_rgb(self.env)
+        frames = refresh_rgb(self.env, update_hz=self.obs_fps)
         state = canonical_state(self._carry).detach().cpu().numpy()
         return self._make_observation(slot_id, frames[slot_id], state[slot_id])
 
@@ -256,5 +257,7 @@ class HaicEnvStepBackend:
         )
 
 
-def build_haic_env_backend(env, policy) -> HaicEnvStepBackend:
-    return HaicEnvStepBackend(env, student_actor_from_policy(policy, env.device))
+def build_haic_env_backend(env, policy, *, obs_fps=10) -> HaicEnvStepBackend:
+    return HaicEnvStepBackend(
+        env, student_actor_from_policy(policy, env.device), obs_fps=obs_fps
+    )

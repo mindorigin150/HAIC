@@ -482,6 +482,7 @@ class HaicVlaContractTest(unittest.TestCase):
 
     def test_latency_eval_leaves_policy_in_common_executor(self):
         config = {
+            "env": {"obs_fps": 50},
             "executor": {"inference_devices": ["cuda:0"]},
             "logging": {"output_dir": "output"},
         }
@@ -498,6 +499,7 @@ class HaicVlaContractTest(unittest.TestCase):
             )
 
         build_backend.assert_called_once()
+        self.assertEqual(build_backend.call_args.kwargs['obs_fps'], 50)
         run_from_config.assert_called_once_with(
             config,
             env_backend=backend,
@@ -553,6 +555,7 @@ class HaicVlaContractTest(unittest.TestCase):
             row_budget=1,
             dagger_round=0,
             vla_cadence=2,
+            action_horizon=40,
             inference_batch_size=1,
         )
         refresh_calls = []

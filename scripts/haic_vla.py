@@ -33,6 +33,7 @@ def _parse_args() -> argparse.Namespace:
         "mode",
         choices=(
             "bootstrap-collect",
+            "teacher-collect",
             "dagger-collect",
             "oracle-eval",
             "latency-eval",
@@ -53,6 +54,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--inference-batch-size", type=int, default=32)
     parser.add_argument("--dagger-round", type=int, default=0)
     parser.add_argument("--vla-cadence", type=int, default=5)
+    parser.add_argument("--action-horizon", type=int, default=40)
     parser.add_argument("--row-budget", type=int, default=32_000)
     parser.add_argument("--config-dir", type=Path)
     parser.add_argument("--eval-config", type=Path)
@@ -169,7 +171,7 @@ def _run_latency_eval(eval_config: dict[str, Any], env, policy) -> dict[str, str
     from active_adaptation.vla.backend import build_haic_env_backend
     from latency_bench.eval.driver import run_from_config
 
-    env_backend = build_haic_env_backend(env, policy)
+    env_backend = build_haic_env_backend(env, policy, obs_fps=eval_config["env"]["obs_fps"])
     run_from_config(
         eval_config,
         env_backend=env_backend,
@@ -422,7 +424,9 @@ def _bootstrap_collect(args, env, policy, simulation_app) -> dict[str, Any]:
     return result
 
 
-def _flush_dagger(output_dir: Path, shard_index: int, rows: list[dict[str, Any]]) -> None:
+def _flush_dagger(
+    output_dir: Path, shard_index: int, rows: list[dict[str, Any]], *, split: str = "train"
+) -> None:
     from latency_bench.data.haic_dagger import write_haic_dagger_shard
 
     video_path = output_dir / f".dagger_{shard_index:06d}.mp4"
@@ -442,7 +446,7 @@ def _flush_dagger(output_dir: Path, shard_index: int, rows: list[dict[str, Any]]
     arrays["image_shape"] = rows[0]["rgb"].shape
     write_haic_dagger_shard(
         output_dir,
-        split="train",
+        split=split,
         episode_idx=shard_index,
         arrays=arrays,
         video_path=video_path,
@@ -451,11 +455,83 @@ def _flush_dagger(output_dir: Path, shard_index: int, rows: list[dict[str, Any]]
 
 
 @torch.inference_mode()
+def _teacher_collect(args, env, policy, simulation_app) -> dict[str, Any]:
+    """Collect H1 teacher episodes with fresh RGB and latent at every 50 Hz step."""
+    from active_adaptation.vla.runtime import (
+        HAIC_CONTROL_HZ,
+        canonical_state,
+        refresh_rgb,
+        student_actor_from_policy,
+        teacher_action,
+        teacher_latent,
+    )
+
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    actor = student_actor_from_policy(policy, env.device)
+    carry = env.reset()
+    rows_by_slot = [[] for _ in range(env.num_envs)]
+    accepted = 0
+    completed = 0
+    row_count = 0
+    while accepted < args.episode_budget and simulation_app.is_running():
+        rgb = refresh_rgb(env, update_hz=HAIC_CONTROL_HZ)
+        state = canonical_state(carry)
+        latent = teacher_latent(policy, carry)
+        labels = teacher_action(policy, carry)
+        states = state.cpu().numpy()
+        latents = latent.cpu().numpy()
+        actions = labels.cpu().numpy()
+        for slot in range(env.num_envs):
+            rows_by_slot[slot].append({
+                "rgb": rgb[slot].copy(),
+                "state": states[slot].copy(),
+                "action": latents[slot].copy(),
+                "actor_input": states[slot].copy(),
+                "teacher_action": actions[slot].copy(),
+                "termination": False,
+            })
+        action_td = carry.clone(False)
+        action_td["action"] = actor(torch.cat((state, latent), dim=-1))
+        td, carry = env.step_and_maybe_reset(action_td)
+        done = td["next", "done"].squeeze(-1)
+        success = td["next", "stats", "success"].squeeze(-1).bool()
+        for slot in done.nonzero(as_tuple=False).flatten().cpu().tolist():
+            completed += 1
+            rows = rows_by_slot[slot]
+            rows[-1]["termination"] = True
+            if accepted < args.episode_budget and (args.keep_failed or success[slot].item()):
+                _flush_dagger(output_dir, accepted, rows, split=args.split)
+                row_count += len(rows)
+                accepted += 1
+            rows_by_slot[slot] = []
+    if accepted != args.episode_budget:
+        raise RuntimeError(
+            f"teacher collector stopped at {accepted}/{args.episode_budget} episodes"
+        )
+    result = {
+        "mode": args.mode,
+        "split": args.split,
+        "episodes": accepted,
+        "completed_episodes": completed,
+        "rows": row_count,
+        "env_fps": HAIC_CONTROL_HZ,
+        "vla_fps": HAIC_CONTROL_HZ,
+        "action_horizon": 1,
+        "teacher_checkpoint": str(args.teacher_checkpoint),
+        "seed": args.seed,
+    }
+    (output_dir / f"teacher-collect-{args.split}.json").write_text(
+        json.dumps(result, indent=2) + "\n", encoding="utf-8"
+    )
+    return result
+
+
+@torch.inference_mode()
 def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
     from latency_bench.core.latency_distribution import derive_seed
 
     from active_adaptation.vla.runtime import (
-        HAIC_ACTION_HORIZON,
         HAIC_CONTROL_HZ,
         HAIC_LATENT_DIM,
         canonical_state,
@@ -473,7 +549,7 @@ def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
     carry = env.reset()
     phase = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
     action_chunk = torch.zeros(
-        env.num_envs, HAIC_ACTION_HORIZON, HAIC_LATENT_DIM, device=env.device
+        env.num_envs, args.action_horizon, HAIC_LATENT_DIM, device=env.device
     )
     episode_counts = [0] * env.num_envs
     rows_by_slot: list[list[dict[str, Any]]] = [[] for _ in range(env.num_envs)]
@@ -576,7 +652,7 @@ def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
             "shard_root": "rollout_shards/train",
             "rows_unit": "control_step",
             "env_fps": 50,
-            "vla_fps": 10,
+            "vla_fps": HAIC_CONTROL_HZ / args.vla_cadence,
             "prompt": "Pull the cart along the reference motion.",
         },
     )
@@ -660,6 +736,8 @@ def main() -> None:
     try:
         if args.mode == "bootstrap-collect":
             result = _bootstrap_collect(args, env, policy, simulation_app)
+        elif args.mode == "teacher-collect":
+            result = _teacher_collect(args, env, policy, simulation_app)
         elif args.mode == "dagger-collect":
             result = _dagger_collect(args, env, policy, simulation_app)
         elif args.mode == "latency-eval":
