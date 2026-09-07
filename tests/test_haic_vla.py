@@ -231,6 +231,17 @@ class HaicVlaContractTest(unittest.TestCase):
         tensordict = _EncodedTensorDict()
         self.assertEqual(teacher_latent(policy, tensordict).shape, (2, 256))
 
+    def test_teacher_latent_rollout_emits_the_scalar_action(self):
+        policy = SimpleNamespace(
+            object_transform=lambda encoded: None,
+            encoder_priv=lambda encoded: encoded.__setitem__(
+                "priv_feature", torch.ones(2, 256)
+            ),
+        )
+        tensordict = _EncodedTensorDict({"policy": torch.zeros(2, 1)})
+        output = runtime.teacher_latent_rollout(policy, tensordict)
+        self.assertEqual(output["action"].shape, (2, 256))
+
     def test_student_actor_tensor_contract(self):
         actor = HaicStudentActor()
         actor_input = torch.zeros(2, 861)
@@ -646,10 +657,12 @@ class HaicVlaContractTest(unittest.TestCase):
         from tensordict import TensorDict
 
         class Latency:
-            last_submission = [{}]
+            last_submission = [{"latency_ms": 0.0}]
             last_application = [None]
+            last_dropped = [False]
 
-            def submit(self, _commands, env_ids):
+            def submit(self, commands, env_ids):
+                assert commands.shape == (1, 1)
                 return torch.ones(1, dtype=torch.bool)
 
             def actions(self, env_ids):
@@ -704,6 +717,95 @@ class HaicVlaContractTest(unittest.TestCase):
         torch.testing.assert_close(
             torch.cat(env.latency_decoder_inputs), torch.tensor([[1.0], [2.0]])
         )
+
+    def test_h1_latency_uses_scalar_commands(self):
+        from tensordict import TensorDict
+
+        submitted = []
+
+        class Latency:
+            last_submission = [None, None]
+            last_application = [None, None]
+            last_dropped = [False, False]
+
+            def submit(self, commands, env_ids):
+                submitted.append(commands.shape)
+                self.last_submission = [{"shape": tuple(commands.shape), "latency_ms": 0.0}] * 2
+                return torch.ones(2, dtype=torch.bool)
+
+            def actions(self, env_ids):
+                return torch.zeros(2, 3)
+
+            def advance(self, env_ids):
+                pass
+
+            def reset(self, env_ids):
+                pass
+
+        env = SimpleNamespace(
+            num_envs=2,
+            cfg=types.SimpleNamespace(
+                latency_command_horizon=1,
+                latent_dim=3,
+                latency_control_repeat=1,
+                latency_gamma=0.9,
+            ),
+            active_env_ids=torch.tensor([0, 1]),
+            device=torch.device("cpu"),
+            discount=torch.ones(2, 1),
+            command_latency=Latency(),
+            latency_decoder=lambda command, carry: torch.zeros(2, 1),
+            latency_observation_norm=lambda td: td,
+            set_active_env_ids=lambda ids: setattr(env, "active_env_ids", torch.as_tensor(ids)),
+            _step_raw=lambda td: TensorDict(
+                {"reward": torch.ones(2, 1), "done": torch.zeros(2, 1, dtype=torch.bool)},
+                batch_size=[2],
+            ),
+        )
+        _native_env_method("_step_latency")(
+            env,
+            TensorDict({"action": torch.zeros(2, 3)}, batch_size=[2]),
+        )
+        self.assertEqual(submitted, [(2, 3)])
+
+    def test_motion_resampling_preserves_static_geometry_and_aligns_contacts(self):
+        import importlib
+
+        # Motion interpolation does not use IsaacLab's scene-name resolver.
+        with patch.dict(
+            sys.modules,
+            {
+                "isaaclab.utils.string": SimpleNamespace(resolve_matching_names=None),
+            },
+        ):
+            motion = importlib.import_module("active_adaptation.utils.motion")
+
+        values = np.arange(6, dtype=np.float32)[:, None]
+        np.testing.assert_array_equal(
+            motion.nearest_frame_sample(values, source_fps=50, target_fps=20)[:, 0],
+            [0.0, 2.0, 5.0],
+        )
+
+        object_points = np.arange(3, dtype=np.float32)[None, :, None]
+        resampled = motion.interpolate(
+            {
+                "body_pos_w": np.zeros((6, 1, 3), dtype=np.float32),
+                "body_lin_vel_w": np.zeros((6, 1, 3), dtype=np.float32),
+                "body_quat_w": np.tile(
+                    np.array([1, 0, 0, 0], dtype=np.float32), (6, 1, 1)
+                ),
+                "body_ang_vel_w": np.zeros((6, 1, 3), dtype=np.float32),
+                "joint_pos": np.arange(6, dtype=np.float32)[:, None],
+                "joint_vel": np.zeros((6, 1), dtype=np.float32),
+                "object_points": object_points,
+            },
+            source_fps=50,
+            target_fps=20,
+        )
+        np.testing.assert_allclose(resampled["joint_pos"][:, 0], [0.0, 2.5, 5.0])
+        self.assertEqual(resampled["joint_pos"].dtype, np.float32)
+        self.assertEqual(resampled["body_quat_w"].dtype, np.float32)
+        np.testing.assert_array_equal(resampled["object_points"], object_points)
 
 if __name__ == "__main__":
     unittest.main()

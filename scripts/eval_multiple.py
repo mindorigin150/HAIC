@@ -34,7 +34,7 @@ def main(cfg: DictConfig):
     app_launcher = AppLauncher(OmegaConf.to_container(cfg.app))
     simulation_app = app_launcher.app
 
-    env, agent, vecnorm = make_env_policy(cfg)
+    env, agent, vecnorm = make_env_policy(cfg, restore_latency_state=False)
     
     # --- 3. Evaluation Loop for Each Checkpoint ---
     all_results = {}

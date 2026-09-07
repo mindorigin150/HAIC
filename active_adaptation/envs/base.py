@@ -513,11 +513,15 @@ class _Env(EnvBase):
         return self._step_raw(tensordict)
 
     def _step_latency(self, tensordict: TensorDictBase) -> TensorDictBase:
-        commands = tensordict["action"].reshape(
-            self.num_envs,
-            int(self.cfg.latency_command_horizon),
-            int(self.cfg.latent_dim),
-        )
+        horizon = self.cfg.latency_command_horizon
+        if horizon == 1:
+            commands = tensordict["action"].reshape(self.num_envs, self.cfg.latent_dim)
+        else:
+            commands = tensordict["action"].reshape(
+                self.num_envs,
+                horizon,
+                self.cfg.latent_dim,
+            )
         base_active_ids = self.active_env_ids.clone()
         active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         active[base_active_ids] = True
@@ -528,6 +532,13 @@ class _Env(EnvBase):
             else None
             for env_id in range(self.num_envs)
         ]
+        latency_ms = torch.zeros_like(self.discount)
+        dropped = torch.zeros_like(admitted)
+        for env_id in base_active_ids.tolist():
+            submission = self.command_latency.last_submission[env_id]
+            if submission is not None:
+                latency_ms[env_id] = submission["latency_ms"]
+            dropped[env_id] = self.command_latency.last_dropped[env_id]
         gamma = self.cfg.latency_gamma
         total_reward = None
         executed_steps = torch.zeros_like(self.discount, dtype=torch.long)
@@ -597,6 +608,8 @@ class _Env(EnvBase):
             self.discount.new_full(self.discount.shape, gamma), executed_steps
         ) / gamma
         result["command_admitted"] = admitted.unsqueeze(-1)
+        result["command_dropped"] = dropped.unsqueeze(-1)
+        result["command_latency_ms"] = latency_ms
         done_ids = terminal_done.nonzero(as_tuple=False).flatten().tolist()
         if done_ids:
             self.command_latency.reset(done_ids)

@@ -1,5 +1,5 @@
 from active_adaptation.envs.mdp.base import Command
-from active_adaptation.utils.motion import MotionDataset, MotionData
+from active_adaptation.utils.motion import MotionDataset, MotionData, nearest_frame_sample
 
 from typing import List, Dict, Tuple, TYPE_CHECKING
 if TYPE_CHECKING:
@@ -8,6 +8,7 @@ if TYPE_CHECKING:
 
 import torch
 import numpy as np
+import json
 from isaaclab.utils.math import sample_uniform, quat_from_euler_xyz, quat_mul, quat_apply, quat_apply_inverse
 from tensordict import TensorDict
 from active_adaptation.utils.math import batchify
@@ -590,15 +591,25 @@ class RobotObjectTracking(RobotTracking):
         all_feet_contact = []
         all_body2_contact = []
         first_motion_data = None
+        target_fps = int(1 / self.env.step_dt)
         for path in motion_paths:
             motion_data = np.load(path, allow_pickle=True)
             if first_motion_data is None:
                 first_motion_data = motion_data
-            all_object_contact.append(motion_data["object_contact"])
-            all_body_contact.append(motion_data["body_contact"][:, contact_eef_body_idx])
-            all_feet_contact.append(motion_data["feet_contact"])
+            with open(path.parent / "meta.json", "r") as f:
+                source_fps = json.load(f)["fps"]
+            body_contact = nearest_frame_sample(motion_data["body_contact"], source_fps, target_fps)
+            all_object_contact.append(
+                nearest_frame_sample(motion_data["object_contact"], source_fps, target_fps)
+            )
+            all_body_contact.append(
+                body_contact[:, contact_eef_body_idx]
+            )
+            all_feet_contact.append(
+                nearest_frame_sample(motion_data["feet_contact"], source_fps, target_fps)
+            )
             if self.object2 is not None:
-                all_body2_contact.append(motion_data["body_contact"][:, contact2_eef_body_idx])
+                all_body2_contact.append(body_contact[:, contact2_eef_body_idx])
 
         object_contact = np.concatenate(all_object_contact, axis=0)
         body_contact = np.concatenate(all_body_contact, axis=0)

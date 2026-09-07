@@ -119,6 +119,7 @@ class PPOConfig:
     clip_adv: float | None = None
     phase: str = "train"
     command_horizon: int = 40
+    eval_teacher: bool = False
     vecnorm: Union[str, None] = None
     checkpoint_path: Union[str, None] = None
     in_keys: List[str] = (CMD_KEY, OBS_KEY, OBJECT_KEY, OBS_PRIV_KEY, OBJECT_GEO_KEY)
@@ -859,7 +860,7 @@ class PPOHAIC(TensorDictModuleBase):
 
         adv = tensordict["adv"]
         log_ratio = (log_probs - tensordict["sample_log_prob"]).unsqueeze(-1)
-        # ponytail: bound H40 joint ratios for float32 gradients; revisit the loss if saturation is common.
+        # Keep log-ratio gradients finite in float32.
         ratio = torch.exp(log_ratio.clamp(-20.0, 20.0))
         surr1 = adv * ratio
         surr2 = adv * ratio.clamp(1.-self.clip_param, 1.+self.clip_param)

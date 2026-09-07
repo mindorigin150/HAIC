@@ -729,7 +729,7 @@ def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from helpers import make_env_policy
 
-    env, policy, _ = make_env_policy(cfg)
+    env, policy, _ = make_env_policy(cfg, restore_latency_state=True)
     env.eval()
     policy.eval()
     exit_code = 0

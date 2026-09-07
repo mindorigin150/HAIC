@@ -26,7 +26,7 @@ def main(cfg):
     simulation_app = app_launcher.app
 
     from helpers import EpisodeStats, make_env_policy, ObsNorm, ObsOODDetector
-    env, policy, vecnorm = make_env_policy(cfg)
+    env, policy, vecnorm = make_env_policy(cfg, restore_latency_state=True)
     
     if cfg.export_policy:
         import time

@@ -211,7 +211,7 @@ class EpisodeStats:
         return self._episodes.item()
 
 
-def make_env_policy(cfg: DictConfig):
+def make_env_policy(cfg: DictConfig, *, restore_latency_state: bool):
     OmegaConf.set_struct(cfg, False)
     from active_adaptation.envs import SimpleEnv
     from torchrl.envs.transforms import TransformedEnv, Compose, InitTracker, VecNorm, StepCounter
@@ -230,10 +230,10 @@ def make_env_policy(cfg: DictConfig):
 
     if cfg.task.latency_command:
         from latency_bench.core.config import load_config
-        from training.common.command_latency import CommandLatencyBatch
+        from training.common.action_latency import ActionLatencyBatch
 
         latency_config = load_config(cfg.task.latency_config_path)
-        base_env.command_latency = CommandLatencyBatch(
+        base_env.command_latency = ActionLatencyBatch(
             latency_config,
             num_envs=base_env.num_envs,
             device=base_env.device,
@@ -251,6 +251,7 @@ def make_env_policy(cfg: DictConfig):
         cfg.task.latency_command
         and checkpoint_path is not None
         and state_dict["policy"]["last_phase"] == "latency_command"
+        and restore_latency_state
     )
     if base_env.command_latency is not None and resuming_latency_command:
         base_env.command_latency.load_state_dict(state_dict["env"]["command_latency"])
@@ -302,7 +303,7 @@ def make_env_policy(cfg: DictConfig):
         print(colored("[Info]: Load policy from checkpoint.", "green"))
         policy.load_state_dict(
             state_dict["policy"],
-            strict=not cfg.task.latency_command or resuming_latency_command,
+            strict=not cfg.task.latency_command or not cfg.algo.eval_teacher,
         )
 
     if cfg.task.latency_command:
@@ -350,6 +351,12 @@ def evaluate(
     keys = set(keys)
     keys.add(("next", "done"))
     keys.add(("next", "stats"))
+    if env.base_env.cfg.latency_command:
+        keys.update({
+            ("next", "command_admitted"),
+            ("next", "command_dropped"),
+            ("next", "command_latency_ms"),
+        })
 
 
     env.base_env.eval()
@@ -382,8 +389,11 @@ def evaluate(
     policy_trajs: TensorDictBase = torch.stack(policy_trajs, dim=1)
     trajs: TensorDictBase = torch.stack(trajs, dim=1)
     done = trajs.get(("next", "done"))
-    episode_cnt = len(done.nonzero())
-    first_done = torch.argmax(done.long(), dim=1).cpu()
+    done_by_slot = done.squeeze(-1)
+    has_done = done_by_slot.any(dim=1)
+    first_done_step = torch.argmax(done_by_slot.long(), dim=1)
+    episode_cnt = int(has_done.sum().item())
+    first_done = first_done_step.unsqueeze(1).cpu()
 
     def take_first_episode(tensor: torch.Tensor):
         indices = first_done.reshape(first_done.shape+(1,)*(tensor.ndim-2))
@@ -395,6 +405,11 @@ def evaluate(
     # shape: (num_envs,)
     for k, v in trajs["next", "stats"].items(True, True):
         v = take_first_episode(v)
+        if isinstance(k, tuple) and k[-1] == "return":
+            key = "eval/" + "/".join((*k[:-1], "episode_return"))
+            stats[key] = v
+            info[key] = torch.mean(v.float()).item()
+            info[key + "_std"] = torch.std(v.float()).item()
         if k == "episode_len" or k == "success":
             pass
         else:
@@ -419,6 +434,19 @@ def evaluate(
         )
 
     info["episode_cnt"] = episode_cnt
+    if env.base_env.cfg.latency_command:
+        first_episode_mask = (
+            torch.arange(done_by_slot.shape[1]).unsqueeze(0)
+            <= first_done_step.unsqueeze(1)
+        ) & has_done.unsqueeze(1)
+        first_episode_mask = first_episode_mask.unsqueeze(-1)
+        admitted = trajs["next", "command_admitted"].bool() & first_episode_mask
+        dropped = trajs["next", "command_dropped"].bool() & first_episode_mask
+        latency_ms = trajs["next", "command_latency_ms"]
+        info["command_admitted_count"] = int(admitted.sum().item())
+        info["command_dropped_count"] = int(dropped.sum().item())
+        admitted_latency = latency_ms.masked_select(admitted)
+        info["command_latency_ms_mean"] = admitted_latency.float().mean().item()
     return dict(sorted(info.items())), trajs, stats, policy_trajs
 
 

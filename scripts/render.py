@@ -30,7 +30,7 @@ def main(cfg):
     # print("isaac dir:", ISAAC_NUCLEUS_DIR)
     # breakpoint()
 
-    env, agent, vecnorm = make_env_policy(cfg)
+    env, agent, vecnorm = make_env_policy(cfg, restore_latency_state=True)
     
     policy_eval = agent.get_rollout_policy("eval")
     evaluate(env, policy_eval, render=cfg.eval_render, render_mode=cfg.render_mode, seed=cfg.seed)
@@ -41,4 +41,3 @@ def main(cfg):
 
 if __name__ == "__main__":
     main()
-

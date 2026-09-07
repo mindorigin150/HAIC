@@ -6,10 +6,16 @@ defaults:
 name: G1PullCart
 
 latency_config_path: null
-latency_command_horizon: 40
-latency_control_repeat: 5
+latency_command_horizon: 1
+latency_control_repeat: 1
 latent_dim: 256
 latency_gamma: 0.99
+
+max_episode_length: 400
+
+sim:
+  step_dt: 0.05
+  isaac_physics_dt: 0.005
 
 viewer:
   env_spacing: 5.0

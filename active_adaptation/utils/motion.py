@@ -75,7 +75,10 @@ unitree_body_names = [
 ]
 
 def lerp(ts_target, ts_source, x):
-    return np.stack([np.interp(ts_target, ts_source, x[:, i]) for i in range(x.shape[1])], axis=-1)
+    return np.stack(
+        [np.interp(ts_target, ts_source, x[:, i]) for i in range(x.shape[1])],
+        axis=-1,
+    ).astype(x.dtype, copy=False)
 
 
 def slerp(ts_target, ts_source, quat):
@@ -92,7 +95,7 @@ def slerp(ts_target, ts_source, quat):
     quat = quat.reshape(steps_source, -1, quat_dim)
 
     batch_size = int(np.prod(batch_shape, initial=1))
-    out = np.empty((steps_target, batch_size, quat_dim))
+    out = np.empty((steps_target, batch_size, quat_dim), dtype=quat.dtype)
     for i in range(batch_size):
         s = Slerp(ts_source, sRot.from_quat(quat[:, i, [1, 2, 3, 0]])) # quat first to quat last
         out[:, i, :] = s(ts_target).as_quat()[..., [3, 0, 1, 2]] # quat last to quat first
@@ -100,18 +103,36 @@ def slerp(ts_target, ts_source, quat):
     return out
 
 
+def _resample_timestamps(length: int, source_fps: float, target_fps: float):
+    end_t = length / source_fps
+    ts_source = np.arange(0, end_t, 1 / source_fps)
+    ts_target = np.arange(0, end_t, 1 / target_fps)
+    if ts_target[-1] > ts_source[-1]:
+        ts_target = ts_target[:-1]
+    return ts_source, ts_target
+
+
+def nearest_frame_sample(values, source_fps: float, target_fps: float):
+    """Resample frame-aligned discrete data without inventing intermediate values."""
+    if source_fps == target_fps:
+        return values
+
+    ts_source, ts_target = _resample_timestamps(values.shape[0], source_fps, target_fps)
+    right = np.searchsorted(ts_source, ts_target, side="left")
+    right = np.minimum(right, len(ts_source) - 1)
+    left = np.maximum(right - 1, 0)
+    use_left = (right == 0) | (
+        ts_target - ts_source[left] <= ts_source[right] - ts_target + 1e-12
+    )
+    indices = np.where(use_left, left, right)
+    return values[indices]
+
+
 def interpolate(motion, source_fps: int, target_fps: int):
     if source_fps != target_fps:
         in_keys = ["body_pos_w", "body_lin_vel_w", "body_quat_w", "body_ang_vel_w", "joint_pos", "joint_vel"]
-        extra_keys = set(motion.keys()) - set(in_keys)
-        if extra_keys:
-            raise NotImplementedError(f"interpolation is not fully implemented for keys: {extra_keys}")
         T = motion["joint_pos"].shape[0]
-        end_t = T / source_fps
-        ts_source = np.arange(0, end_t, 1 / source_fps)
-        ts_target = np.arange(0, end_t, 1 / target_fps)
-        if ts_target[-1] > ts_source[-1]:
-            ts_target = ts_target[:-1]
+        ts_source, ts_target = _resample_timestamps(T, source_fps, target_fps)
         motion["body_pos_w"] = lerp(ts_target, ts_source, motion["body_pos_w"].reshape(T, -1)).reshape(len(ts_target), -1, 3)
         motion["body_lin_vel_w"] = lerp(ts_target, ts_source, motion["body_lin_vel_w"].reshape(T, -1)).reshape(len(ts_target), -1, 3)
         motion["body_quat_w"] = slerp(ts_target, ts_source, motion["body_quat_w"])
@@ -283,8 +304,14 @@ class MotionDataset:
             dst_joint_indices = dst_joint_indices + dst_more_joint_indices
 
             for motion in motions:
-                joint_pos = np.zeros((motion["joint_pos"].shape[0], len(joint_names)))
-                joint_vel = np.zeros((motion["joint_vel"].shape[0], len(joint_names)))
+                joint_pos = np.zeros(
+                    (motion["joint_pos"].shape[0], len(joint_names)),
+                    dtype=motion["joint_pos"].dtype,
+                )
+                joint_vel = np.zeros(
+                    (motion["joint_vel"].shape[0], len(joint_names)),
+                    dtype=motion["joint_vel"].dtype,
+                )
                 joint_pos[:, dst_joint_indices] = motion["joint_pos"][:, src_joint_indices]
                 joint_vel[:, dst_joint_indices] = motion["joint_vel"][:, src_joint_indices]
                 motion["joint_pos"] = joint_pos

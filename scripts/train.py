@@ -75,7 +75,7 @@ def main(cfg: DictConfig):
         run.save(cfg_save_path, policy="now")
         run.save(os.path.join(run.dir, "config.yaml"), policy="now")
 
-    env, policy, vecnorm = make_env_policy(cfg)
+    env, policy, vecnorm = make_env_policy(cfg, restore_latency_state=True)
 
     if aa.is_main_process():
         source_path = inspect.getfile(policy.__class__)

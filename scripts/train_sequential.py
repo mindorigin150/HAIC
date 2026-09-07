@@ -69,7 +69,7 @@ def run_training_stage(cfg: DictConfig, return_queue: multiprocessing.Queue = No
 
     # 2. --- Environment and Policy Creation ---
     # `make_env_policy` will handle loading the checkpoint if `cfg.checkpoint_path` is set
-    env, policy, vecnorm = make_env_policy(cfg)
+    env, policy, vecnorm = make_env_policy(cfg, restore_latency_state=True)
 
     # Save policy source code for reproducibility
     source_path = inspect.getfile(policy.__class__)

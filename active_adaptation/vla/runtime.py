@@ -40,6 +40,14 @@ def teacher_latent(policy, tensordict) -> torch.Tensor:
 
 
 @torch.inference_mode()
+def teacher_latent_rollout(policy, tensordict):
+    """Return a native rollout tensordict carrying the teacher latent action."""
+    output = tensordict.clone(False)
+    output["action"] = teacher_latent(policy, tensordict)
+    return output
+
+
+@torch.inference_mode()
 def teacher_action(policy, tensordict) -> torch.Tensor:
     """Return the full teacher distribution mean after reference residual."""
     encoded = _teacher_encoded(policy, tensordict)
