@@ -96,6 +96,9 @@ class _FakeEvalEnv:
 
 
 class _FakePool:
+    def predict_batch(self, observations):
+        return [SimpleNamespace(action_chunk=np.zeros((40, 256), dtype=np.float32)) for _ in observations]
+
     def close(self):
         pass
 
@@ -182,44 +185,18 @@ class HaicVlaContractTest(unittest.TestCase):
         )
         self.assertIsNone(observations[0].data)
 
-    def test_predict_vla_batches_compact_observations_with_their_slots(self):
-        seen = []
-
-        def predict_batch(observations):
-            seen.extend(
-                (
-                    item.metadata["slot_id"],
-                    item.metadata["haic_state"][0],
-                    item.metadata["env_raw_rgb_frame_stack"][0, 0, 0, 0],
-                )
-                for item in observations
-            )
-            return [
-                SimpleNamespace(
-                    action_chunk=np.repeat(
-                        item.metadata["haic_state"][None], 40, axis=0
-                    ),
-                )
-                for item in observations
-            ]
-
-        output = runtime.predict_vla(
-            SimpleNamespace(predict_batch=predict_batch),
+    def test_compact_vla_observations_preserve_noncontiguous_slot_order(self):
+        observations = runtime.vla_observations(
             np.arange(5, dtype=np.uint8).reshape(5, 1, 1, 1),
             np.arange(5, dtype=np.float32).reshape(5, 1),
-            [2, 7, 11, 19, 23],
-            [100, 101, 102, 103, 104],
-            step=0,
-            batch_size=2,
-        )
-
-        np.testing.assert_array_equal(
-            output[:, :, 0], np.repeat(np.arange(5)[:, None], 40, axis=1)
+            [2, 7, 11, 19, 23], [100, 101, 102, 103, 104], control_step=0,
         )
         self.assertEqual(
-            seen,
+            [(item.metadata["slot_id"], item.metadata["haic_state"][0],
+              item.metadata["env_raw_rgb_frame_stack"][0, 0, 0, 0]) for item in observations],
             [(2, 0, 0), (7, 1, 1), (11, 2, 2), (19, 3, 3), (23, 4, 4)],
         )
+
 
     def test_teacher_latent_is_only_the_consumed_privileged_feature(self):
         policy = SimpleNamespace(
@@ -491,6 +468,17 @@ class HaicVlaContractTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(generators[1].get_state(), before))
 
+    def test_collector_batch_size_reaches_inference_pool(self):
+        config = {"executor": {"inference_batch_size": 8}}
+        args = SimpleNamespace(policy_config=Path("policy.yaml"),
+                               inference_batch_size=32, inference_device="cuda:0")
+        with patch("latency_bench.core.config.load_config", return_value=config), patch(
+            "latency_bench.executors.realtime.pool.ProcessInferencePool"
+        ) as pool:
+            haic_vla._new_pool(args)
+        self.assertEqual(pool.call_args.kwargs["config"]["executor"]["inference_batch_size"], 32)
+        self.assertEqual(pool.call_args.kwargs["inference_devices"], ["cuda:0"])
+
     def test_latency_eval_leaves_policy_in_common_executor(self):
         config = {
             "env": {"obs_fps": 50},
@@ -576,17 +564,12 @@ class HaicVlaContractTest(unittest.TestCase):
             count = 1 if slots is None else len(slots)
             return np.zeros((count, 1, 1, 3), dtype=np.uint8)
 
-        def predict_vla(_pool, _rgb, _state, slots, _episode_seeds, _step, _batch_size):
-            return np.zeros((len(slots), 40, 256), dtype=np.float32)
-
         with patch.object(haic_vla, "_new_pool", return_value=_FakePool()), patch.object(
             haic_vla, "_flush_dagger", return_value=0.0
         ), patch.object(
             runtime, "canonical_state", return_value=torch.zeros(1, 605)
         ), patch.object(
             runtime, "refresh_rgb", side_effect=refresh_rgb
-        ), patch.object(
-            runtime, "predict_vla", side_effect=predict_vla
         ), patch.object(
             runtime, "teacher_latent", return_value=torch.zeros(1, 256)
         ), patch.object(

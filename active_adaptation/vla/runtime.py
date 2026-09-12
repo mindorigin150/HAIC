@@ -125,26 +125,3 @@ def vla_observations(
             rgb, state, slots, episode_seeds, strict=True
         )
     ]
-
-
-def predict_vla(
-    pool,
-    rgb: np.ndarray,
-    state: np.ndarray,
-    slots: Sequence[int],
-    episode_seeds: Sequence[int | None],
-    step: int,
-    batch_size: int,
-) -> np.ndarray:
-    """Predict one GR00T action chunk per requested environment slot."""
-    actions = []
-    for start in range(0, len(slots), batch_size):
-        batch = slice(start, start + batch_size)
-        observations = vla_observations(
-            rgb[batch], state[batch], slots[batch], episode_seeds[batch], step
-        )
-        actions.extend(
-            np.asarray(output.action_chunk, dtype=np.float32)
-            for output in pool.predict_batch(observations)
-        )
-    return np.stack(actions)

@@ -5,8 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
+import tempfile
 import traceback
 from pathlib import Path
 from typing import Any
@@ -23,6 +23,9 @@ for source_root in (HAIC_ROOT, REPO_ROOT):
 sys.path[:0] = [str(HAIC_ROOT), str(REPO_ROOT)]
 
 HAIC_TASK = "G1/haic/pull_cart"
+
+from latency_bench.data.background_writer import BackgroundWriter
+from latency_bench.data.episode_io import encode_video
 
 
 def _parse_args() -> argparse.Namespace:
@@ -114,37 +117,7 @@ def _compose_cfg(args: argparse.Namespace):
 def _encode_video(frames: list[np.ndarray], path: Path) -> None:
     import imageio_ffmpeg
 
-    frame = np.asarray(frames[0], dtype=np.uint8)
-    process = subprocess.Popen(
-        [
-            imageio_ffmpeg.get_ffmpeg_exe(),
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "rawvideo",
-            "-pixel_format",
-            "rgb24",
-            "-video_size",
-            f"{frame.shape[1]}x{frame.shape[0]}",
-            "-framerate",
-            "50",
-            "-i",
-            "pipe:0",
-            "-an",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            str(path),
-        ],
-        stdin=subprocess.PIPE,
-    )
-    process.stdin.write(np.asarray(frames, dtype=np.uint8).tobytes())
-    process.stdin.close()
-    return_code = process.wait()
-    if return_code:
-        raise subprocess.CalledProcessError(return_code, process.args)
+    encode_video(frames, path, fps=50, executable=imageio_ffmpeg.get_ffmpeg_exe())
 
 
 def _write_metadata(output_dir: Path, metadata: dict[str, Any]) -> None:
@@ -161,6 +134,7 @@ def _new_pool(args: argparse.Namespace):
     from latency_bench.executors.realtime.pool import ProcessInferencePool
 
     config = load_config(args.policy_config)
+    config["executor"]["inference_batch_size"] = args.inference_batch_size
     return ProcessInferencePool(
         config=config,
         inference_devices=[args.inference_device],
@@ -429,29 +403,28 @@ def _flush_dagger(
 ) -> None:
     from latency_bench.data.haic_dagger import write_haic_dagger_shard
 
-    video_path = output_dir / f".dagger_{shard_index:06d}.mp4"
-    _encode_video([row["rgb"] for row in rows], video_path)
-    arrays = {
-        name: np.stack([row[name] for row in rows])
-        for name in (
-            "state",
-            "action",
-            "actor_input",
-            "teacher_action",
-            "termination",
-        )
-    }
-    if np.asarray(arrays["termination"]).ndim == 1:
+    with tempfile.TemporaryDirectory(prefix=".dagger_", dir=output_dir) as directory:
+        video_path = Path(directory) / "episode.mp4"
+        _encode_video([row["rgb"] for row in rows], video_path)
+        arrays = {
+            name: np.stack([row[name] for row in rows])
+            for name in (
+                "state",
+                "action",
+                "actor_input",
+                "teacher_action",
+                "termination",
+            )
+        }
         arrays["termination"][-1] = True
-    arrays["image_shape"] = rows[0]["rgb"].shape
-    write_haic_dagger_shard(
-        output_dir,
-        split=split,
-        episode_idx=shard_index,
-        arrays=arrays,
-        video_path=video_path,
-    )
-    video_path.unlink()
+        arrays["image_shape"] = rows[0]["rgb"].shape
+        write_haic_dagger_shard(
+            output_dir,
+            split=split,
+            episode_idx=shard_index,
+            arrays=arrays,
+            video_path=video_path,
+        )
 
 
 @torch.inference_mode()
@@ -474,37 +447,42 @@ def _teacher_collect(args, env, policy, simulation_app) -> dict[str, Any]:
     accepted = 0
     completed = 0
     row_count = 0
-    while accepted < args.episode_budget and simulation_app.is_running():
-        rgb = refresh_rgb(env, update_hz=HAIC_CONTROL_HZ)
-        state = canonical_state(carry)
-        latent = teacher_latent(policy, carry)
-        labels = teacher_action(policy, carry)
-        states = state.cpu().numpy()
-        latents = latent.cpu().numpy()
-        actions = labels.cpu().numpy()
-        for slot in range(env.num_envs):
-            rows_by_slot[slot].append({
-                "rgb": rgb[slot].copy(),
-                "state": states[slot].copy(),
-                "action": latents[slot].copy(),
-                "actor_input": states[slot].copy(),
-                "teacher_action": actions[slot].copy(),
-                "termination": False,
-            })
-        action_td = carry.clone(False)
-        action_td["action"] = actor(torch.cat((state, latent), dim=-1))
-        td, carry = env.step_and_maybe_reset(action_td)
-        done = td["next", "done"].squeeze(-1)
-        success = td["next", "stats", "success"].squeeze(-1).bool()
-        for slot in done.nonzero(as_tuple=False).flatten().cpu().tolist():
-            completed += 1
-            rows = rows_by_slot[slot]
-            rows[-1]["termination"] = True
-            if accepted < args.episode_budget and (args.keep_failed or success[slot].item()):
-                _flush_dagger(output_dir, accepted, rows, split=args.split)
-                row_count += len(rows)
-                accepted += 1
-            rows_by_slot[slot] = []
+    writer = BackgroundWriter()
+    try:
+        while accepted < args.episode_budget and simulation_app.is_running():
+            writer.poll()
+            rgb = refresh_rgb(env, update_hz=HAIC_CONTROL_HZ)
+            state = canonical_state(carry)
+            latent = teacher_latent(policy, carry)
+            labels = teacher_action(policy, carry)
+            states = state.cpu().numpy()
+            latents = latent.cpu().numpy()
+            actions = labels.cpu().numpy()
+            for slot in range(env.num_envs):
+                rows_by_slot[slot].append({
+                    "rgb": rgb[slot].copy(),
+                    "state": states[slot].copy(),
+                    "action": latents[slot].copy(),
+                    "actor_input": states[slot].copy(),
+                    "teacher_action": actions[slot].copy(),
+                    "termination": False,
+                })
+            action_td = carry.clone(False)
+            action_td["action"] = actor(torch.cat((state, latent), dim=-1))
+            td, carry = env.step_and_maybe_reset(action_td)
+            done = td["next", "done"].squeeze(-1)
+            success = td["next", "stats", "success"].squeeze(-1).bool()
+            for slot in done.nonzero(as_tuple=False).flatten().cpu().tolist():
+                completed += 1
+                rows = rows_by_slot[slot]
+                rows[-1]["termination"] = True
+                if accepted < args.episode_budget and (args.keep_failed or success[slot].item()):
+                    writer.submit(_flush_dagger, output_dir, accepted, rows, split=args.split)
+                    row_count += len(rows)
+                    accepted += 1
+                rows_by_slot[slot] = []
+    finally:
+        writer.close()
     if accepted != args.episode_budget:
         raise RuntimeError(
             f"teacher collector stopped at {accepted}/{args.episode_budget} episodes"
@@ -529,106 +507,18 @@ def _teacher_collect(args, env, policy, simulation_app) -> dict[str, Any]:
 
 @torch.inference_mode()
 def _dagger_collect(args, env, policy, simulation_app) -> dict[str, Any]:
-    from latency_bench.core.latency_distribution import derive_seed
-
-    from active_adaptation.vla.runtime import (
-        HAIC_CONTROL_HZ,
-        HAIC_LATENT_DIM,
-        canonical_state,
-        predict_vla,
-        teacher_latent,
-        refresh_rgb,
-        teacher_action,
-        student_actor_from_policy,
-    )
+    # Isaac/HAIC dependencies are imported after AppLauncher has initialized Kit.
+    from active_adaptation.vla.dagger import HaicDaggerAdapter
+    from active_adaptation.vla.runtime import HAIC_CONTROL_HZ
+    from latency_bench.data.dagger import collect_dagger
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    pool = _new_pool(args)
-    actor = student_actor_from_policy(policy, env.device)
-    carry = env.reset()
-    phase = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
-    action_chunk = torch.zeros(
-        env.num_envs, args.action_horizon, HAIC_LATENT_DIM, device=env.device
+    adapter = HaicDaggerAdapter(args, env, policy, _flush_dagger)
+    row_count = collect_dagger(
+        adapter, _new_pool(args), row_budget=args.row_budget, seed=args.seed,
+        is_running=simulation_app.is_running,
     )
-    episode_counts = [0] * env.num_envs
-    rows_by_slot: list[list[dict[str, Any]]] = [[] for _ in range(env.num_envs)]
-    row_count = 0
-    control_step = 0
-    shard_index = 0
-
-    try:
-        while row_count < args.row_budget and simulation_app.is_running():
-            rgb = refresh_rgb(env, update_hz=HAIC_CONTROL_HZ)
-            state = canonical_state(carry)
-            state_cpu = state.detach().cpu().numpy().astype(np.float32, copy=False)
-            due = (phase == 0).nonzero(as_tuple=False).flatten()
-            if due.numel():
-                due_slots = due.cpu().tolist()
-                predicted = predict_vla(
-                    pool,
-                    rgb[due_slots],
-                    state_cpu[due.cpu().numpy()],
-                    due_slots,
-                    [
-                        derive_seed(
-                            args.seed,
-                            vector_index=slot,
-                            episode_idx=episode_counts[slot],
-                        )
-                        for slot in due_slots
-                    ],
-                    control_step,
-                    args.inference_batch_size,
-                )
-                action_chunk[due] = torch.from_numpy(predicted).to(env.device)
-            target = teacher_latent(policy, carry)
-            target_cpu = target.cpu().numpy().astype(np.float32, copy=False)
-            labels = teacher_action(policy, carry)
-            labels_cpu = labels.cpu().numpy().astype(np.float32, copy=False)
-            action_latent = action_chunk[
-                torch.arange(env.num_envs, device=env.device), phase
-            ]
-            fixed_action = actor(torch.cat((state, action_latent), dim=-1))
-            for slot in range(env.num_envs):
-                rows_by_slot[slot].append(
-                    {
-                        "rgb": rgb[slot].copy(),
-                        "state": state_cpu[slot].copy(),
-                        "action": target_cpu[slot].copy(),
-                        "actor_input": state_cpu[slot].copy(),
-                        "teacher_action": labels_cpu[slot].copy(),
-                        "termination": False,
-                    }
-                )
-            action_td = carry.clone(False)
-            action_td["action"] = fixed_action
-            td, carry = env.step_and_maybe_reset(action_td)
-            done = td["next", "done"].squeeze(-1)
-            phase.add_(1).remainder_(args.vla_cadence)
-            phase[done] = 0
-            control_step += 1
-            for slot in done.nonzero(as_tuple=False).flatten().cpu().tolist():
-                episode_counts[slot] += 1
-                episode_rows = rows_by_slot[slot]
-                episode_rows[-1]["termination"] = True
-                remaining = args.row_budget - row_count
-                if remaining:
-                    segment = episode_rows[:remaining]
-                    _flush_dagger(output_dir, shard_index, segment)
-                    row_count += len(segment)
-                    shard_index += 1
-                rows_by_slot[slot] = []
-    finally:
-        for episode_rows in rows_by_slot:
-            remaining = args.row_budget - row_count
-            if not episode_rows or not remaining:
-                continue
-            segment = episode_rows[:remaining]
-            _flush_dagger(output_dir, shard_index, segment)
-            row_count += len(segment)
-            shard_index += 1
-        pool.close()
 
     result = {
         "mode": args.mode,

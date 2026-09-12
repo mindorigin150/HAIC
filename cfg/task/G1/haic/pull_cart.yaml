@@ -14,7 +14,7 @@ latency_gamma: 0.99
 max_episode_length: 400
 
 sim:
-  step_dt: 0.05
+  step_dt: 0.02
   isaac_physics_dt: 0.005
 
 viewer:
