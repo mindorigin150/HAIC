@@ -32,6 +32,8 @@ def main(cfg: DictConfig):
     output_dir = Path(HydraConfig.get().runtime.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Asset scaling and material randomization run during environment construction.
+    torch.manual_seed(cfg.seed)
     env, agent, vecnorm = make_env_policy(cfg, restore_latency_state=False)
     
     keys = [
@@ -55,8 +57,20 @@ def main(cfg: DictConfig):
         policy_eval = lambda tensordict: teacher_latent_rollout(agent, tensordict)
     else:
         policy_eval = agent.get_rollout_policy("eval")
+    first_slot_trace = []
+    if cfg.record_first_episode:
+        rollout_policy = policy_eval
+
+        def policy_eval(tensordict):
+            output = rollout_policy(tensordict)
+            first_slot_trace.append(output.select("policy", "command", "action")[0].detach().cpu())
+            return output
+
     render_mode = cfg.get("render_mode", "rgb_array")
     info, trajs, stats, policy_trajs = evaluate(env, policy_eval, render=cfg.eval_render, render_mode=render_mode, seed=cfg.seed, keys=keys, policy_keys=policy_keys)
+    if cfg.record_first_episode:
+        first_done = trajs["next", "done"][0, :, 0].nonzero()[0, 0].item()
+        torch.save(torch.stack(first_slot_trace)[:first_done + 1], output_dir / "first_episode.pt")
     
     # print(termcolor.colored(trajs, "light_yellow"))
     # time_str = datetime.datetime.now().strftime("%m-%d_%H-%M")
@@ -72,9 +86,11 @@ def main(cfg: DictConfig):
     info["algo"] = cfg.algo.name
     info["checkpoint_path"] = cfg.checkpoint_path
     info["teacher_baseline"] = eval_teacher
+    info["physics_step_dt"] = env.base_env.step_dt
     info["env_fps"] = 1.0 / env.base_env.step_dt
     if cfg.task.latency_command:
         latency_config = load_config(cfg.task.latency_config_path)
+        info["env_fps"] = latency_config["env"]["env_fps"]
         info["latency_method"] = latency_config["latency"]["method"]
         info["latency_config_path"] = cfg.task.latency_config_path
         if info["latency_method"] == "temporal":
