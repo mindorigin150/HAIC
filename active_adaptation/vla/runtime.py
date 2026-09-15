@@ -105,7 +105,7 @@ def vla_observations(
     episode_seeds: Sequence[int | None],
     control_step: int,
 ) -> list[Any]:
-    """Build parent-process observations for the official GR00T pool."""
+    """Build parent-process observations for the StarVLA pool."""
     from latency_bench.core.types import Observation
     from latency_bench.envs.raw_rgb import ENV_RAW_RGB_FRAME_STACK_INFO_KEY
 
